@@ -1,0 +1,9 @@
+[package]
+name = "alien-codec"
+version = "0.1.0"
+edition = "2021"
+description = "Output encoders: opaque blob and stealth formats (emoji, pseudo-words)"
+
+[dependencies]
+base64 = "0.22"
+thiserror = "2"

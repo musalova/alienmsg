@@ -1,0 +1,10 @@
+target/
+**/*.rs.bk
+Cargo.lock.bak
+app/build/
+app/.dart_tool/
+app/.flutter-plugins*
+app/windows/flutter/
+app/android/.gradle/
+app/ios/Pods/
+*.vault

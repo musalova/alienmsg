@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/alien-core",
+    "crates/alien-codec",
+    "crates/alien-store",
+    "crates/alien-ffi",
+]
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
