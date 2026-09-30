@@ -1,4 +1,5 @@
 target/
+flutter-sdk/
 **/*.rs.bk
 Cargo.lock.bak
 app/build/
