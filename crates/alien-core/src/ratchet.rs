@@ -39,7 +39,10 @@ pub struct SkippedKey {
 
 /// A pairwise Double Ratchet session. Serializable: secrets are raw scalars,
 /// the whole blob lives inside the encrypted vault.
-#[derive(Serialize, Deserialize)]
+///
+/// `Clone` is required by the forge-resistant decrypt path: a DH ratchet step
+/// is performed on a scratch copy and committed only after AEAD success.
+#[derive(Serialize, Deserialize, Clone)]
 pub struct SessionState {
     pub version: u8,
     pub rk: [u8; 32],
@@ -65,6 +68,19 @@ pub struct SessionState {
     pub pending_init: Option<PendingInit>,
     /// Unix timestamp of creation (informational).
     pub created: u64,
+}
+
+impl Drop for SessionState {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.rk.zeroize();
+        self.my_ratchet_secret.zeroize();
+        self.send_ck.zeroize();
+        self.recv_ck.zeroize();
+        for s in &mut self.skipped {
+            s.mk.zeroize();
+        }
+    }
 }
 
 fn kdf_rk(rk: &[u8; 32], dh_out: &[u8; 32]) -> Result<([u8; 32], [u8; 32])> {
@@ -112,7 +128,10 @@ pub fn aead_seal(mk: &[u8; 32], ad: &[u8], pt: &[u8]) -> ([u8; 24], Vec<u8>) {
     let cipher = XChaCha20Poly1305::new(Key::from_slice(mk));
     let nonce_bytes: [u8; 24] = rand::random();
     let ct = cipher
-        .encrypt(XNonce::from_slice(&nonce_bytes), Payload { msg: pt, aad: ad })
+        .encrypt(
+            XNonce::from_slice(&nonce_bytes),
+            Payload { msg: pt, aad: ad },
+        )
         .expect("aead encrypt");
     (nonce_bytes, ct)
 }
@@ -205,10 +224,12 @@ impl SessionState {
         if until - self.recv_n > MAX_SKIP_PER_CALL {
             return Err(Error::Ratchet("too many skipped messages"));
         }
+        // Pre-check capacity so the update below is atomic: a failure mid-loop
+        // would advance recv_n without committing recv_ck, corrupting the chain.
+        if self.skipped.len() + (until - self.recv_n) as usize > MAX_SKIPPED_TOTAL {
+            return Err(Error::Ratchet("skipped-key store full"));
+        }
         while self.recv_n < until {
-            if self.skipped.len() >= MAX_SKIPPED_TOTAL {
-                return Err(Error::Ratchet("skipped-key store full"));
-            }
             let (next, mk) = kdf_ck(&ck);
             ck = next;
             self.skipped.push(SkippedKey {
@@ -239,7 +260,9 @@ impl SessionState {
         self.remote_pn = remote_pn;
 
         let fresh = StaticSecret::random_from_rng(OsRng);
-        let dh2 = fresh.diffie_hellman(&PublicKey::from(new_remote)).to_bytes();
+        let dh2 = fresh
+            .diffie_hellman(&PublicKey::from(new_remote))
+            .to_bytes();
         let (rk2, send_ck) = kdf_rk(&self.rk, &dh2)?;
         self.rk = rk2;
         self.pn = self.send_n;
@@ -287,33 +310,58 @@ impl SessionState {
         full_ad.extend_from_slice(ad);
         full_ad.extend_from_slice(&header_bytes);
 
-        if let Some(mk) = self.take_skipped(&header.dh, header.n) {
-            let pt = aead_open(&mk, nonce, &full_ad, ct)?;
+        // Skipped-key path: remove the stored key only *after* a successful
+        // decrypt. Otherwise a tampered in-transit message would burn the key
+        // and make the legit re-delivery permanently undecryptable.
+        if let Some(pos) = self
+            .skipped
+            .iter()
+            .position(|s| s.dh == header.dh && s.n == header.n)
+        {
+            let pt = aead_open(&self.skipped[pos].mk, nonce, &full_ad, ct)?;
+            self.skipped.remove(pos);
             return Ok(pt);
         }
 
         if self.remote_ratchet_pub != Some(header.dh) {
-            self.dh_ratchet_step(header.dh, header.pn)?;
+            // A new remote ratchet key mixes the received DH into the root
+            // key. If we committed the step before authenticating the message,
+            // one forged header would permanently desynchronize `rk` between
+            // the peers (each subsequent step derives from the diverged root)
+            // — a single malicious packet would kill the session forever.
+            // So the step runs on a scratch copy and is committed only after
+            // a successful AEAD open on the new chain.
+            let mut next = self.clone();
+            next.dh_ratchet_step(header.dh, header.pn)?;
+            let pt = next.decrypt_on_current_chain(&full_ad, header, nonce, ct)?;
+            *self = next;
+            return Ok(pt);
         }
 
+        self.decrypt_on_current_chain(&full_ad, header, nonce, ct)
+    }
+
+    /// Decrypt on the *current* receiving chain (no DH ratchet step).
+    /// Commits the chain advance only after a successful AEAD open.
+    fn decrypt_on_current_chain(
+        &mut self,
+        full_ad: &[u8],
+        header: &MsgHeader,
+        nonce: &[u8; 24],
+        ct: &[u8],
+    ) -> Result<Vec<u8>> {
         if header.n < self.recv_n {
             return Err(Error::Ratchet("replayed or duplicated message"));
         }
         self.store_skipped(header.dh, header.n)?;
-        // advance chain to n and consume mk
+        // derive mk at index n; commit the chain advance only if AEAD succeeds,
+        // so a tampered message does not destroy the slot forever.
         let ck = self.recv_ck.ok_or(Error::Ratchet("no receiving chain"))?;
         let (next_ck, mk) = kdf_ck(&ck);
+        let pt = aead_open(&mk, nonce, full_ad, ct)?;
         self.recv_ck = Some(next_ck);
         self.recv_n = header.n + 1;
-
-        aead_open(&mk, nonce, &full_ad, ct)
-    }
-
-    fn take_skipped(&mut self, dh: &[u8; 32], n: u32) -> Option<[u8; 32]> {
-        self.skipped
-            .iter()
-            .position(|s| &s.dh == dh && s.n == n)
-            .map(|i| self.skipped.remove(i).mk)
+        Ok(pt)
     }
 
     /// Serialize the session (opaque blob for the vault / FFI).
@@ -326,9 +374,16 @@ impl SessionState {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn now_unix() -> u64 {
+    // wasm32-unknown-unknown has no std clock; use the JS Date via wasm-bindgen.
+    (js_sys::Date::now() / 1000.0) as u64
 }

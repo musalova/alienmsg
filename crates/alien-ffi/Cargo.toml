@@ -5,7 +5,7 @@ edition = "2021"
 description = "C ABI bridge (JSON in/out) consumed by the Flutter app via dart:ffi"
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 alien-core = { path = "../alien-core" }
@@ -14,3 +14,14 @@ alien-store = { path = "../alien-store" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
+zeroize = "1.9.0"
+rand = "0.8"
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Security_Cryptography",
+    "Win32_Foundation",
+] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+getrandom = { version = "0.2", features = ["js"] }

@@ -3,9 +3,16 @@ flutter-sdk/
 **/*.rs.bk
 Cargo.lock.bak
 app/build/
+app/android/build/
+app/android/app/build/
 app/.dart_tool/
 app/.flutter-plugins*
 app/windows/flutter/
 app/android/.gradle/
+app/android/app/src/main/jniLibs/
 app/ios/Pods/
 *.vault
+*.vault.corrupt-*
+app/web/pkg/
+tools/wasm-bindgen/
+cloudflared.exe

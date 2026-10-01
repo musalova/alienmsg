@@ -14,8 +14,7 @@ const SALT_DOMAIN: &[u8] = b"AlienMsg/recovery/v1";
 
 /// Generate a fresh 24-word Italian mnemonic (BIP-39 checksummed).
 pub fn generate_mnemonic() -> Result<String> {
-    let m = Mnemonic::generate_in(Language::Italian, WORD_COUNT)
-        .map_err(|_| Error::Mnemonic)?;
+    let m = Mnemonic::generate_in(Language::Italian, WORD_COUNT).map_err(|_| Error::Mnemonic)?;
     Ok(m.to_string())
 }
 

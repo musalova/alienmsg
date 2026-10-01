@@ -28,10 +28,33 @@ pub enum CodecError {
 pub const BLOB_PREFIX: &str = "AYA1:";
 /// Marker emoji signalling an emoji-encoded AlienMsg payload.
 const EMOJI_MARKER: char = '👽';
-/// Emoji alphabet: scalars U+1F300..=U+1F3FF (Misc Symbols & Pictographs).
-/// All are single Unicode scalars — no ZWJ sequences, no modifiers — so each
-/// encodes exactly one byte and survives copy/paste intact.
-const EMOJI_BASE: u32 = 0x1F300;
+/// Emoji alphabet, 256 standalone scalars:
+///   bytes 0x00..=0x7F -> U+1F300..=U+1F37F (Misc Symbols)
+///   bytes 0x80..=0xFF -> U+1F400..=U+1F47F (Animals & Nature)
+/// The range U+1F3FB..=U+1F3FF is deliberately excluded: those are Fitzpatrick
+/// skin-tone *modifiers*, which renderers merge with the preceding emoji and
+/// carriers may normalize away — corrupting the payload.
+const EMOJI_BASE_A: u32 = 0x1F300;
+const EMOJI_BASE_B: u32 = 0x1F400;
+
+fn emoji_of(b: u8) -> char {
+    let cp = if b < 0x80 {
+        EMOJI_BASE_A + b as u32
+    } else {
+        EMOJI_BASE_B + (b as u32 - 0x80)
+    };
+    char::from_u32(cp).expect("valid scalar")
+}
+
+fn byte_of(cp: u32) -> Option<u8> {
+    if (EMOJI_BASE_A..EMOJI_BASE_A + 0x80).contains(&cp) {
+        Some((cp - EMOJI_BASE_A) as u8)
+    } else if (EMOJI_BASE_B..EMOJI_BASE_B + 0x80).contains(&cp) {
+        Some((cp - EMOJI_BASE_B + 0x80) as u8)
+    } else {
+        None
+    }
+}
 
 const CONSONANTS: [char; 16] = [
     'b', 'd', 'f', 'g', 'h', 'j', 'k', 'l', 'm', 'n', 'p', 'r', 's', 't', 'v', 'z',
@@ -52,7 +75,7 @@ pub fn encode(data: &[u8], format: Format) -> String {
             let mut s = String::with_capacity(data.len() * 4 + 4);
             s.push(EMOJI_MARKER);
             for &b in data {
-                s.push(char::from_u32(EMOJI_BASE + b as u32).expect("valid scalar"));
+                s.push(emoji_of(b));
             }
             s
         }
@@ -83,7 +106,9 @@ pub fn decode(input: &str) -> Result<Vec<u8>, CodecError> {
             .decode(rest.trim())
             .map_err(|_| CodecError::Malformed);
     }
-    if trimmed.starts_with(EMOJI_MARKER) {
+    // Tolerate leading text before the marker (chat apps often prepend quotes,
+    // sender names, etc.) — decode_emoji skips everything up to it.
+    if trimmed.contains(EMOJI_MARKER) {
         return decode_emoji(trimmed);
     }
     decode_words(trimmed)
@@ -100,10 +125,15 @@ fn decode_emoji(s: &str) -> Result<Vec<u8>, CodecError> {
             continue;
         }
         let cp = ch as u32;
-        if (EMOJI_BASE..EMOJI_BASE + 256).contains(&cp) {
-            out.push((cp - EMOJI_BASE) as u8);
-        } else if ch.is_whitespace() {
-            continue; // tolerate whitespace injected by carriers
+        if let Some(b) = byte_of(cp) {
+            out.push(b);
+        } else if ch.is_whitespace()
+            || cp == 0xFE0F            // emoji variation selector
+            || cp == 0x200D            // ZWJ
+            || (0x1F3FB..=0x1F3FF).contains(&cp)
+        // stray skin-tone modifiers
+        {
+            continue; // tolerate decorations injected by carriers
         } else {
             return Err(CodecError::Malformed);
         }
@@ -177,6 +207,38 @@ mod tests {
         let d = vec![0x12, 0xAB, 0x00, 0xFF];
         let enc = encode(&d, Format::Words);
         let noisy = enc.replace(' ', "  ,  ");
+        assert_eq!(decode(&noisy).unwrap(), d);
+    }
+
+    #[test]
+    fn emoji_avoids_modifier_scalars() {
+        // Bytes 0xFB..=0xFF must NOT map to the Fitzpatrick modifiers
+        // U+1F3FB..=U+1F3FF, which carriers can merge/normalize away.
+        for b in 0xFBu8..=0xFF {
+            let cp = emoji_of(b) as u32;
+            assert!(
+                !(0x1F3FB..=0x1F3FF).contains(&cp),
+                "byte {b:#x} -> modifier"
+            );
+        }
+        // And every scalar in the alphabet is a standalone emoji.
+        for b in 0u8..=255 {
+            let cp = emoji_of(b);
+            assert!(
+                (0x1F300..=0x1F37F).contains(&(cp as u32))
+                    || (0x1F400..=0x1F47F).contains(&(cp as u32))
+            );
+        }
+    }
+
+    #[test]
+    fn emoji_tolerates_variation_selectors_and_prefix_text() {
+        let d = sample();
+        let mut enc = encode(&d, Format::Emoji);
+        // Carriers may append U+FE0F after emoji scalars, and chat apps may
+        // prepend sender/quote text before the marker.
+        enc = enc.chars().flat_map(|c| [c, '\u{FE0F}']).collect();
+        let noisy = format!("da Marco: {enc}");
         assert_eq!(decode(&noisy).unwrap(), d);
     }
 }

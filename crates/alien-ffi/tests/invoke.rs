@@ -6,7 +6,8 @@ use serde_json::{json, Value};
 
 fn invoke(req: Value) -> Value {
     let s = req.to_string();
-    let buf = alien_invoke(s.as_ptr(), s.len());
+    // SAFETY: `s` outlives the call; returned buf is freed below.
+    let buf = unsafe { alien_invoke(s.as_ptr(), s.len()) };
     assert!(!buf.is_null());
     unsafe {
         let b = &*buf;
@@ -43,8 +44,10 @@ impl Device {
     fn make_card(&mut self) -> (String, String) {
         let r = ok(json!({"op":"card_create","identity":self.identity}));
         self.bundles.push(r["bundle"].as_str().unwrap().to_string());
-        (r["card_envelope"].as_str().unwrap().to_string(),
-         r["card"].as_str().unwrap().to_string())
+        (
+            r["card_envelope"].as_str().unwrap().to_string(),
+            r["card"].as_str().unwrap().to_string(),
+        )
     }
     fn recv(&mut self, env_b64: &str) -> Value {
         let r = ok(json!({
@@ -66,10 +69,16 @@ impl Device {
 fn ffi_full_flow() {
     // --- setup two devices
     let m1 = ok(json!({"op":"mnemonic_generate"}))["mnemonic"]
-        .as_str().unwrap().to_string();
+        .as_str()
+        .unwrap()
+        .to_string();
     let m2 = ok(json!({"op":"mnemonic_generate"}))["mnemonic"]
-        .as_str().unwrap().to_string();
-    assert!(ok(json!({"op":"mnemonic_validate","phrase":m1}))["valid"].as_bool().unwrap());
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(ok(json!({"op":"mnemonic_validate","phrase":m1}))["valid"]
+        .as_bool()
+        .unwrap());
 
     let mut alice = Device::new(&m1);
     let mut bob = Device::new(&m2);
@@ -80,9 +89,14 @@ fn ffi_full_flow() {
 
     // render card as blob text -> unrender back to envelope
     let txt_a = ok(json!({"op":"render","bytes":card_a_env,"format":"blob"}))["text"]
-        .as_str().unwrap().to_string();
+        .as_str()
+        .unwrap()
+        .to_string();
     assert!(txt_a.starts_with("AYA1:"));
-    let env_a = ok(json!({"op":"unrender","text":txt_a}))["bytes"].as_str().unwrap().to_string();
+    let env_a = ok(json!({"op":"unrender","text":txt_a}))["bytes"]
+        .as_str()
+        .unwrap()
+        .to_string();
     assert_eq!(env_a, card_a_env);
 
     let card_a_parsed = bob.recv(&env_a);
@@ -92,7 +106,9 @@ fn ffi_full_flow() {
     let s = ok(json!({
         "op":"session_start","identity":alice.identity,
         "my_card":card_a,"peer_card":card_b}));
-    alice.sessions.push(s["session"].as_str().unwrap().to_string());
+    alice
+        .sessions
+        .push(s["session"].as_str().unwrap().to_string());
 
     // --- alice encrypts first message (PairInit), renders as emoji
     let e = ok(json!({
@@ -100,15 +116,21 @@ fn ffi_full_flow() {
     alice.sessions[0] = e["session"].as_str().unwrap().to_string();
     let env_b64 = e["envelope"].as_str().unwrap().to_string();
     let txt = ok(json!({"op":"render","bytes":env_b64,"format":"emoji"}))["text"]
-        .as_str().unwrap().to_string();
+        .as_str()
+        .unwrap()
+        .to_string();
     assert!(txt.starts_with('👽'));
 
     // bob unrenders + decrypts
-    let env2 = ok(json!({"op":"unrender","text":txt}))["bytes"].as_str().unwrap().to_string();
+    let env2 = ok(json!({"op":"unrender","text":txt}))["bytes"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let d = bob.recv(&env2);
     assert_eq!(d["kind"], "new_session");
     assert_eq!(d["plaintext"], "ciao bob");
-    bob.sessions.push(d["session"].as_str().unwrap().to_string());
+    bob.sessions
+        .push(d["session"].as_str().unwrap().to_string());
 
     // bob replies
     let e2 = ok(json!({
@@ -123,8 +145,12 @@ fn ffi_full_flow() {
     let gc = ok(json!({
         "op":"group_create","identity":alice.identity,
         "sessions":alice.sessions,"member_ids":[bob_id],"name":"nucleo"}));
-    alice.sessions = gc["sessions"].as_array().unwrap()
-        .iter().map(|v| v.as_str().unwrap().to_string()).collect();
+    alice.sessions = gc["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
     alice.groups.push(gc["group"].as_str().unwrap().to_string());
     let invite = gc["envelope"].as_str().unwrap().to_string();
 
@@ -134,7 +160,8 @@ fn ffi_full_flow() {
 
     // bob sends group message
     let ge = ok(json!({
-        "op":"group_encrypt","group":bob.groups[0],"plaintext":"segreto di gruppo"}));
+        "op":"group_encrypt","identity":bob.identity,
+        "group":bob.groups[0],"plaintext":"segreto di gruppo"}));
     bob.groups[0] = ge["group"].as_str().unwrap().to_string();
     let dg = alice.recv(ge["envelope"].as_str().unwrap());
     assert_eq!(dg["kind"], "group_text");

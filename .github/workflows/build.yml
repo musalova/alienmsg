@@ -1,0 +1,108 @@
+name: Build AlienMsg
+
+on:
+  push:
+    branches: [master, main]
+  workflow_dispatch:   # → "Run workflow" button in Actions tab
+
+jobs:
+  android-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+      - uses: android-actions/setup-android@v3
+      - name: Rust libs (Windows + Android)
+        run: |
+          cargo install cargo-ndk
+          cargo build --release -p alien-ffi
+          cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 `
+            -o app/android/app/src/main/jniLibs build --release -p alien-ffi
+        shell: pwsh
+      - name: Build Windows exe
+        working-directory: app
+        run: flutter build windows --release
+      - name: Build Android APK
+        working-directory: app
+        run: flutter build apk --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: alienmsg-windows
+          path: app/build/windows/x64/runner/Release/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: alienmsg-android
+          path: app/build/app/outputs/flutter-apk/app-release.apk
+
+  ios:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+      - name: Build Rust XCFramework
+        run: bash scripts/build_ios.sh
+      - name: Flutter pub get
+        working-directory: app
+        run: flutter pub get
+      - name: Pod install
+        working-directory: app/ios
+        run: pod install
+      - name: Build unsigned IPA (no Apple account needed for this step)
+        working-directory: app
+        run: flutter build ios --release --no-codesign
+      - name: Package IPA
+        run: |
+          cd app/build/ios/iphoneos
+          mkdir -p Payload
+          cp -R Runner.app Payload/
+          zip -r alienmsg.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: alienmsg-ios-unsigned
+          path: app/build/ios/iphoneos/alienmsg.ipa
+
+  web:
+    # PWA: Rust → WASM, Flutter → web, deployed to GitHub Pages.
+    # This is the free/no-expiry install path for iPhone (Safari →
+    # "Add to Home Screen").
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Build Rust → WASM + JS bindings
+        run: bash scripts/build_wasm.sh
+      - name: Build Flutter web (base-href = /<repo>/ for project Pages)
+        working-directory: app
+        run: flutter build web --release --base-href "/${{ github.event.repository.name }}/"
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: app/build/web
+      - uses: actions/deploy-pages@v4
+        id: deployment
+      - name: Web bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: alienmsg-web
+          path: app/build/web

@@ -1,0 +1,24 @@
+name: flutter_secure_storage_windows
+description: >-
+  Stub replacement for the flutter_secure_storage Windows federated plugin.
+  The upstream plugin requires the ATL/MFC headers (atlstr.h), which are not
+  part of a minimal VS Build Tools install — and AlienMsg does not need the
+  plugin on Windows at all: secrets there go through DPAPI in alien-ffi.
+  Declaring this as a plain package (no `plugin:` section) means nothing is
+  compiled or registered on Windows.
+version: 4.0.0
+publish_to: none
+
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_secure_storage_platform_interface: ^2.1.1
+
+flutter:
+  plugin:
+    platforms:
+      windows:
+        dartPluginClass: FlutterSecureStorageWindows

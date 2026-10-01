@@ -11,10 +11,10 @@ void main() {
   final dllPath =
       '${Directory.current.parent.path}\\target\\release\\alien_ffi.dll';
 
-  setUpAll(() {
+  setUpAll(() async {
     expect(File(dllPath).existsSync(), isTrue,
         reason: 'compila prima: cargo build --release -p alien-ffi');
-    AlienFfi.init(libraryPath: dllPath);
+    await AlienFfi.init(libraryPath: dllPath);
   });
 
   test('mnemonic → identity', () async {
@@ -92,7 +92,7 @@ void main() {
     expect(dj['kind'], 'group_joined');
     var groupB = dj['group'] as String;
 
-    final ge = AlienApi.groupEncrypt(groupB, 'messaggio di gruppo');
+    final ge = AlienApi.groupEncrypt(seedB, groupB, 'messaggio di gruppo');
     groupB = ge['group'] as String;
     final dg = AlienApi.decrypt(
       identityB64: seedA,
@@ -105,5 +105,44 @@ void main() {
     expect(dg['plaintext'], 'messaggio di gruppo');
     groupA = (dg['groups'] as List).first as String;
     expect(AlienApi.groupInfo(groupA)['epoch'], 1);
+  });
+
+  test('vault password protection', () async {
+    final dir = await Directory.systemTemp.createTemp('alienmsg-vault');
+    final path = '${dir.path}${Platform.pathSeparator}test.vault';
+    try {
+      expect(AlienApi.vaultProbe(path)['exists'], isFalse);
+
+      // create a protected vault
+      var r = AlienApi.vaultOpen(path, 'segreta');
+      var h = r['handle'] as int;
+      expect(r['protected'], isTrue);
+      AlienApi.vaultSet(h, 'k', 'dmFsdWU='); // b64('value')
+      AlienApi.vaultSave(h, path);
+      AlienApi.vaultClose(h);
+
+      // probe flags it; empty and wrong passwords are rejected
+      expect(AlienApi.vaultProbe(path)['needs_password'], isTrue);
+      expect(() => AlienApi.vaultOpen(path, ''),
+          throwsA(isA<AlienException>()));
+      expect(() => AlienApi.vaultOpen(path, 'sbagliata'),
+          throwsA(isA<AlienException>()));
+
+      // correct password opens and reads
+      r = AlienApi.vaultOpen(path, 'segreta');
+      h = r['handle'] as int;
+      expect(AlienApi.vaultGet(h, 'k'), 'dmFsdWU=');
+
+      // removing the password downgrades to a plain vault
+      AlienApi.vaultSetPassword(h, path, '');
+      AlienApi.vaultClose(h);
+      expect(AlienApi.vaultProbe(path)['needs_password'], isFalse);
+      r = AlienApi.vaultOpen(path, '');
+      h = r['handle'] as int;
+      expect(AlienApi.vaultGet(h, 'k'), 'dmFsdWU=');
+      AlienApi.vaultClose(h);
+    } finally {
+      await dir.delete(recursive: true);
+    }
   });
 }

@@ -7,7 +7,15 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>Alienmsg</string>
+	<string>AlienMsg</string>
+	<key>NSFaceIDUsageDescription</key>
+	<string>Usa Face ID per sbloccare il tuo profilo AlienMsg</string>
+	<key>NSBiometricUsageDescription</key>
+	<string>Usa l'impronta o il volto per sbloccare il tuo profilo AlienMsg</string>
+	<key>UIRequiredDeviceCapabilities</key>
+	<array>
+		<string>arm64</string>
+	</array>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>

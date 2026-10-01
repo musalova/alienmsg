@@ -1,9 +1,9 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../api.dart';
 import '../store.dart';
-import '../main.dart' show copyToClipboard;
-import 'widgets.dart';
+import 'chat_panel.dart';
 
 class GroupScreen extends StatelessWidget {
   final GroupChat group;
@@ -11,6 +11,13 @@ class GroupScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: store,
+      builder: (_, __) => _build(context),
+    );
+  }
+
+  Widget _build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
         title: Text(group.name),
@@ -22,14 +29,20 @@ class GroupScreen extends StatelessWidget {
           ),
         ],
       ),
-      body: CryptoPanel(
-        onEncrypt: (pt, fmt) => store.encryptGroup(group, pt, fmt),
-        onDecrypt: (input) {
+      body: ChatPanel(
+        historyKey: Store.historyKeyForGroup(group.groupId),
+        onSend: (pt, fmt) => store.encryptGroup(group, pt, fmt),
+        onReceive: (input) {
           final r = store.processInbound(input);
           return switch (r.kind) {
-            'group_text' => '[${(r.peerId ?? '?').substring(0, 8)}] ${r.text}',
-            'text' => r.text,
-            _ => r.text,
+            'group_text' =>
+              ReceivedMsg(r.text, from: _memberLabel(r.peerId ?? '?')),
+            'card' => const ReceivedMsg(
+                'È il codice di un contatto — aggiungilo dalla scheda '
+                'Contatti (pulsante 👤+).',
+                system: true),
+            'info' => ReceivedMsg(r.text, system: true),
+            _ => ReceivedMsg(r.text),
           };
         },
       ),
@@ -48,11 +61,12 @@ class GroupScreen extends StatelessWidget {
       return;
     }
     final members = (info['members'] as List).cast<Map<String, dynamic>>();
-    final isAdmin = members.any((m) => m['is_me'] == true && m['is_admin'] == true);
+    final isAdmin =
+        members.any((m) => m['is_me'] == true && m['is_admin'] == true);
     await showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: Text('Membri — epoch ${info['epoch']}'),
+        title: const Text('Membri del gruppo'),
         content: SizedBox(
           width: 360,
           child: ListView(
@@ -65,12 +79,16 @@ class GroupScreen extends StatelessWidget {
                       ? Icons.star_outline
                       : Icons.person_outline),
                   title: Text(_memberLabel(m['id'] as String)),
-                  subtitle: Text((m['id'] as String).substring(0, 16)),
                   trailing: (isAdmin && m['is_me'] != true)
                       ? IconButton(
+                          tooltip: 'Rimuovi dal gruppo',
                           icon: const Icon(Icons.remove_circle_outline),
-                          onPressed: () => _removeMember(ctx, m['id'] as String,
-                              members.map((x) => x['id'] as String).toList()),
+                          onPressed: () => _removeMember(
+                              ctx,
+                              m['id'] as String,
+                              members
+                                  .map((x) => x['id'] as String)
+                                  .toList()),
                         )
                       : null,
                 ),
@@ -90,6 +108,7 @@ class GroupScreen extends StatelessWidget {
       if (c.pubId == pubId) return c.name;
     }
     if (pubId == store.pubId) return 'Tu';
+    if (pubId.length < 8) return 'Membro';
     return 'Membro ${pubId.substring(0, 8)}';
   }
 
@@ -98,23 +117,21 @@ class GroupScreen extends StatelessWidget {
     try {
       final keep = all.where((id) => id != removeId).toList();
       final blob = store.rotateGroup(group, keep);
+      Clipboard.setData(ClipboardData(text: blob));
       if (dialogCtx.mounted) {
         Navigator.pop(dialogCtx);
         await showDialog(
           context: dialogCtx,
           builder: (ctx2) => AlertDialog(
-            title: const Text('Chiave ruotata'),
+            title: const Text('Membro rimosso'),
             content: const Text(
-                'Incolla questo blob nel gruppo: i membri rimasti passeranno '
-                'alla nuova epoch. Chi è stato rimosso non leggerà più.'),
+                'Ho copiato un codice di aggiornamento: incollalo nel gruppo. '
+                'Gli altri membri passeranno alle nuove chiavi e chi è uscito '
+                'non potrà più leggere.'),
             actions: [
-              FilledButton.icon(
-                onPressed: () {
-                  copyToClipboard(ctx2, blob, 'Blob rotazione copiato');
-                  Navigator.pop(ctx2);
-                },
-                icon: const Icon(Icons.copy),
-                label: const Text('Copia rotazione'),
+              FilledButton(
+                onPressed: () => Navigator.pop(ctx2),
+                child: const Text('Fatto'),
               ),
             ],
           ),

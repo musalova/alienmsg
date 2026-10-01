@@ -83,10 +83,18 @@ pub struct GroupRotatePayload {
 pub struct GroupMsgPayload {
     pub group_id: [u8; 16],
     pub epoch: u64,
+    /// Sender's pub_id (= SHA256("alienmsg/pubid/v1" ‖ sender_ed ‖ sender_x)).
     pub sender: [u8; 32],
+    /// Sender's long-term Ed25519 public key (self-certifying with sender_x).
+    pub sender_ed: [u8; 32],
+    /// Sender's long-term X25519 public key.
+    pub sender_x: [u8; 32],
     pub n: u32,
     pub nonce: [u8; 24],
     pub ct: Vec<u8>,
+    /// Ed25519 signature by `sender_ed` over the full AD ‖ nonce ‖ ct.
+    #[serde(with = "crate::serutil::arr64")]
+    pub signature: [u8; 64],
 }
 
 /// Inner plaintext of a pairwise envelope carrying group key material.
@@ -98,6 +106,7 @@ pub struct InviteInner {
     pub group_key: [u8; 32],
     pub admin: [u8; 32],
     pub members: Vec<[u8; 32]>,
+    pub name: String,
 }
 
 /// Frame a typed envelope.

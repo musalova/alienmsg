@@ -11,7 +11,8 @@ use std::io::Read;
 
 fn invoke(req: Value) -> Value {
     let s = req.to_string();
-    let buf = alien_invoke(s.as_ptr(), s.len());
+    // SAFETY: `s` outlives the call; returned buf is freed below.
+    let buf = unsafe { alien_invoke(s.as_ptr(), s.len()) };
     if buf.is_null() {
         return json!({"ok": false, "error": "null buf"});
     }
@@ -49,7 +50,7 @@ fn main() {
                 eprintln!("json non valido");
                 std::process::exit(2);
             });
-            println!("{}", invoke(req).to_string());
+            println!("{}", invoke(req));
         }
         _ => {
             eprintln!(
@@ -72,28 +73,43 @@ fn demo() {
     println!("=== AlienMsg demo — due dispositivi virtuali ===\n");
 
     let ma = ok(json!({"op":"mnemonic_generate"}))["mnemonic"]
-        .as_str().unwrap().to_string();
+        .as_str()
+        .unwrap()
+        .to_string();
     let mb = ok(json!({"op":"mnemonic_generate"}))["mnemonic"]
-        .as_str().unwrap().to_string();
+        .as_str()
+        .unwrap()
+        .to_string();
     println!("Alice frase: {}", trunc(&ma, 60));
     println!("Bob   frase: {}\n", trunc(&mb, 60));
 
     let ida = ok(json!({"op":"identity_create","mnemonic":ma}));
     let idb = ok(json!({"op":"identity_create","mnemonic":mb}));
-    let (sa, sb) = (ida["identity"].as_str().unwrap(), idb["identity"].as_str().unwrap());
-    let (pa, pb) = (ida["pub_id"].as_str().unwrap(), idb["pub_id"].as_str().unwrap());
+    let (sa, sb) = (
+        ida["identity"].as_str().unwrap(),
+        idb["identity"].as_str().unwrap(),
+    );
+    let (pa, pb) = (
+        ida["pub_id"].as_str().unwrap(),
+        idb["pub_id"].as_str().unwrap(),
+    );
     println!("Alice pub_id: {}", trunc(pa, 32));
     println!("Bob   pub_id: {}\n", trunc(pb, 32));
 
     let ca = ok(json!({"op":"card_create","identity":sa}));
     let cb = ok(json!({"op":"card_create","identity":sb}));
     let (card_a, card_b) = (ca["card"].as_str().unwrap(), cb["card"].as_str().unwrap());
-    let (bundle_a, bundle_b) =
-        (ca["bundle"].as_str().unwrap(), cb["bundle"].as_str().unwrap());
+    let (bundle_a, bundle_b) = (
+        ca["bundle"].as_str().unwrap(),
+        cb["bundle"].as_str().unwrap(),
+    );
     println!("Carte generate (con prekey ML-KEM-1024 firmate).");
-    println!("Fingerprint SAS: {}",
+    println!(
+        "Fingerprint SAS: {}",
         ok(json!({"op":"fingerprint","identity":sa,"peer_card":card_b}))["sas"]
-            .as_str().unwrap());
+            .as_str()
+            .unwrap()
+    );
 
     let sess = ok(json!({
         "op":"session_start","identity":sa,"my_card":card_a,"peer_card":card_b}));
@@ -101,44 +117,77 @@ fn demo() {
     println!("\nSessione ibrida PQ stabilita (X25519+ML-KEM-1024 → Double Ratchet).\n");
 
     // Alice → Bob
-    let e = ok(json!({"op":"encrypt","session":session_a,"plaintext":"Ciao Bob, messaggio segretissimo!"}));
+    let e = ok(
+        json!({"op":"encrypt","session":session_a,"plaintext":"Ciao Bob, messaggio segretissimo!"}),
+    );
     session_a = e["session"].as_str().unwrap().to_string();
     let env = e["envelope"].as_str().unwrap().to_string();
     for fmt in ["blob", "emoji", "words"] {
-        let t = ok(json!({"op":"render","bytes":env,"format":fmt}))["text"].as_str().unwrap().to_string();
+        let t = ok(json!({"op":"render","bytes":env,"format":fmt}))["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
         println!("--- formato {fmt} ---\n{}\n", trunc(&t, 240));
     }
-    let txt = ok(json!({"op":"render","bytes":env,"format":"blob"}))["text"].as_str().unwrap().to_string();
-    let env2 = ok(json!({"op":"unrender","text":txt}))["bytes"].as_str().unwrap().to_string();
+    let txt = ok(json!({"op":"render","bytes":env,"format":"blob"}))["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let env2 = ok(json!({"op":"unrender","text":txt}))["bytes"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let d = ok(json!({"op":"decrypt","identity":sb,"bundles":[bundle_b],
         "sessions":[],"groups":[],"envelope":env2}));
-    println!("Bob decifra (nuova sessione): \"{}\"\n", d["plaintext"].as_str().unwrap());
+    println!(
+        "Bob decifra (nuova sessione): \"{}\"\n",
+        d["plaintext"].as_str().unwrap()
+    );
     let mut session_b = d["session"].as_str().unwrap().to_string();
 
     // Bob → Alice
-    let e2 = ok(json!({"op":"encrypt","session":session_b,"plaintext":"Ricevuto, Alice. Canale sicuro."}));
+    let e2 = ok(
+        json!({"op":"encrypt","session":session_b,"plaintext":"Ricevuto, Alice. Canale sicuro."}),
+    );
     session_b = e2["session"].as_str().unwrap().to_string();
     let d2 = ok(json!({"op":"decrypt","identity":sa,"bundles":[bundle_a],
         "sessions":[session_a],"groups":[],"envelope":e2["envelope"].as_str().unwrap()}));
     println!("Alice decifra: \"{}\"\n", d2["plaintext"].as_str().unwrap());
-    let sessions_a: Vec<String> = d2["sessions"].as_array().unwrap()
-        .iter().map(|v| v.as_str().unwrap().to_string()).collect();
+    let sessions_a: Vec<String> = d2["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
 
     // Gruppo
-    let gc = ok(json!({"op":"group_create","identity":sa,"sessions":sessions_a,
-        "member_ids":[pb],"name":"nucleo"}));
-    println!("Gruppo creato: {}", trunc(gc["group_id"].as_str().unwrap(), 16));
+    let gc = ok(
+        json!({"op":"group_create","identity":sa,"sessions":sessions_a,
+        "member_ids":[pb],"name":"nucleo"}),
+    );
+    println!(
+        "Gruppo creato: {}",
+        trunc(gc["group_id"].as_str().unwrap(), 16)
+    );
     let dj = ok(json!({"op":"decrypt","identity":sb,"bundles":[bundle_b],
         "sessions":[session_b],"groups":[],"envelope":gc["envelope"].as_str().unwrap()}));
-    println!("Bob entrato nel gruppo (kind={})", dj["kind"].as_str().unwrap());
+    println!(
+        "Bob entrato nel gruppo (kind={})",
+        dj["kind"].as_str().unwrap()
+    );
     let group_b = dj["group"].as_str().unwrap().to_string();
 
-    let ge = ok(json!({"op":"group_encrypt","group":group_b,"plaintext":"messaggio al gruppo"}));
+    let ge = ok(
+        json!({"op":"group_encrypt","identity":sb,"group":group_b,"plaintext":"messaggio al gruppo"}),
+    );
     let dg = ok(json!({"op":"decrypt","identity":sa,"bundles":[bundle_a],
         "sessions":gc["sessions"].as_array().unwrap(),
         "groups":[gc["group"].as_str().unwrap()],
         "envelope":ge["envelope"].as_str().unwrap()}));
-    println!("Alice legge dal gruppo: \"{}\"", dg["plaintext"].as_str().unwrap());
+    println!(
+        "Alice legge dal gruppo: \"{}\"",
+        dg["plaintext"].as_str().unwrap()
+    );
 
     println!("\n=== demo completata: handshake PQ ✓ ratchet ✓ gruppo ✓ stealth ✓ ===");
 }

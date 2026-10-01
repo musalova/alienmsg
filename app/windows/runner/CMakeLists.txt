@@ -40,7 +40,7 @@ target_include_directories(${BINARY_NAME} PRIVATE "${CMAKE_SOURCE_DIR}")
 add_dependencies(${BINARY_NAME} flutter_assemble)
 
 # Bundle the Rust crypto library next to the executable.
-set(ALIEN_FFI_DLL "${CMAKE_CURRENT_SOURCE_DIR}/../../target/release/alien_ffi.dll")
+set(ALIEN_FFI_DLL "${CMAKE_CURRENT_SOURCE_DIR}/../../../target/release/alien_ffi.dll")
 if(EXISTS "${ALIEN_FFI_DLL}")
   add_custom_command(TARGET ${BINARY_NAME} POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different

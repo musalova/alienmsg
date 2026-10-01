@@ -67,22 +67,52 @@ type: 0x01 Card | 0x02 PairInit | 0x03 PairMsg
 
 PairInit payload: `{init: {eph, pq_ct, recipient_card_id, card}, header, nonce[24], ct}`.
 PairMsg payload: `{header, nonce[24], ct}`.
+GroupMsg payload: `{group_id, epoch, sender, sender_ed, sender_x, n, nonce[24], ct, signature[64]}`.
 
-## Gruppi (sender-key)
+## Gruppi (sender-key + firme)
 
 - `K_g` casuale per epoch; chain di invio per membro:
-  `send_ck = HKDF(K_g, "gsend" ‖ sender_pubid)`.
+  `send_ck = HKDF(salt="AlienMsg/GroupSend/v1", ikm=K_g).expand(sender_pubid)`.
 - mk per messaggio: `HMAC(ck,"gmk")`; chain: `HMAC(ck,"gck")`.
-- Invito/rotazione: `InviteInner{group_id, epoch, k_g, admin, members}`
-  wrappato per-membro dentro envelope PairMsg (consuma il ratchet pairwise —
-  autenticità ereditata dalla sessione E2E).
+- **Autenticazione del mittente**: le chain sono derivabili da ogni membro,
+  quindi AEAD da solo non basta. Ogni `GroupMsg` porta
+  `{sender_ed, sender_x, signature}`; la coppia è self-certifying
+  (`SHA256("alienmsg/pubid/v1"‖ed‖x) == sender`) e la firma Ed25519 copre
+  `"AlienMsg/GroupSig/v1" ‖ AD ‖ nonce ‖ ct`. Un membro non può spacciarsi
+  per un altro.
+- **Autorizzazione**: inviti e rotazioni sono accettati solo se il wrap interno
+  arriva dalla sessione pairwise dell'*admin* del gruppo (`peer_id == admin`),
+  con `kind`, `group_id` ed `epoch` coerenti tra envelope esterno e interno.
+- Invito/rotazione: `InviteInner{kind, group_id, epoch, k_g, admin, members,
+  name}` wrappato per-membro dentro envelope PairMsg (consuma il ratchet
+  pairwise — autenticità ereditata dalla sessione E2E).
 - Rimozione membro → `K_g'` + epoch+1, wrappata ai soli rimasti. Vecchie epoch
-  (≤8) conservate per messaggi in ritardo; l'espulso non riceve la nuova chiave.
+  (≤8) conservate per messaggi in ritardo; i membri espulsi entrano in
+  `excluded` e **non possono postare** nemmeno sulle vecchie epoch.
+- `GroupState` versione 2: il formato serializzato non è retrocompatibile
+  (vault pre-0.2 va ri-creato).
+
+## Robustezza anti-tampering
+
+- Ratchet: le chain keys e le skipped-key sono committate **solo dopo** una
+  decifratura AEAD riuscita — un messaggio corrotto in transito non brucia
+  la chiave: la riconsegna integra funziona.
+- Lo **stesso principio vale per il DH ratchet step**: un nuovo `header.dh`
+  viene applicato su una copia scratch e committato solo se un messaggio sulla
+  nuova chain si autentica. Altrimenti un header forgiato mescolerebbe DH
+  dell'attaccante nel root key e desincronizzerebbe `rk` *permanentemente*
+  tra i due peer (DoS irreversibile della sessione).
+- Replay di `PairInit`: instradato alla sessione esistente via `session_id`,
+  respinto come replay; niente sessioni duplicate.
+- Il bundle prekey consumato (`spk` + `pq_dk`) viene eliminato dopo l'accept:
+  la risposta FFI espone `consumed_bundle`.
 
 ## Codec di output (`alien-codec`)
 
 - **Blob**: `AYA1:` + base64url.
-- **Emoji**: `👽` + 1 emoji/byte (alfabeto U+1F300..U+1F3FF).
+- **Emoji**: `👽` + 1 emoji/byte (alfabeto U+1F300..U+1F37F ∪ U+1F400..U+1F47F —
+  esclusi i modificatori skin-tone U+1F3FB..U+1F3FF che i carrier possono
+  normalizzare; tollerati in input whitespace, VS16, ZWJ e testo prima del marker).
 - **Parole**: sillabe CV (16 consonanti × 16 vocali = 256 → 1 byte).
 
 Lo stealth è *opacità*, non sicurezza aggiuntiva: il ciphertext AEAD è già
@@ -91,7 +121,20 @@ indistinguibile da rumore.
 ## Vault (`alien-store`)
 
 `ALNV ‖ ver ‖ salt(16) ‖ nonce(24) ‖ XChaCha20-Poly1305(postcard map)`,
-chiave = Argon2id(password, salt) — o chiave casuale se password vuota.
+chiave = Argon2id(password, salt).
+
+`ver` funge da flag di protezione leggibile in chiaro:
+
+- **1** = vault non protetto: la chiave è derivata dalla password vuota —
+  AEAD a riposo ma decifrabile da chiunque abbia il file;
+- **2** = vault protetto: la chiave è derivata dalla password utente —
+  senza di essa il file è opaco.
+
+`vault_probe` espone `{exists, needs_password}` senza decifrare, così la UI
+distingue "file corrotto" da "serve la password" senza rischiare di
+quarantenare un vault integro. Il vault contiene il seed master
+dell'identità: la protezione con password è **fortemente consigliata**
+(Impostazioni → Password del vault).
 
 ## Threat model (onesto)
 

@@ -12,13 +12,38 @@ dependencies:
   ffi: ^2.1.0
   path_provider: ^2.1.0
   qr_flutter: ^4.1.0
-  mobile_scanner: ^5.0.0
-  share_plus: ^10.0.0
+  local_auth: ^3.0.2
+  flutter_secure_storage: ^11.2.0
+  url_launcher: ^6.3.2
+  package_info_plus: ^10.2.1
+  http: ^1.6.0
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^4.0.0
+  flutter_launcher_icons: ^0.14.4
+
+# flutter_secure_storage's Windows plugin needs ATL/MFC (atlstr.h), absent
+# from minimal VS Build Tools — and unused anyway: on Windows secrets go
+# through the DPAPI ops in alien-ffi. Stub it so the Windows build skips it.
+dependency_overrides:
+  flutter_secure_storage_windows:
+    path: packages/fssw_stub
+
+flutter_launcher_icons:
+  android: true
+  ios: true
+  remove_alpha_ios: true
+  windows:
+    generate: true
+  web:
+    generate: true
+  image_path: "assets/icon/logo.png"
+  adaptive_icon_background: "#1A1030"
+  adaptive_icon_foreground: "assets/icon/logo_fg.png"
 
 flutter:
   uses-material-design: true
+  assets:
+    - assets/icon/logo.png

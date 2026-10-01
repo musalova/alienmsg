@@ -17,8 +17,14 @@ pub enum Inbound {
     Card(ContactCard),
     /// A PairInit created a new session with `peer_id` and carried plaintext.
     NewSession {
-        session: SessionState,
+        session: Box<SessionState>,
         plaintext: Vec<u8>,
+        /// The initiator's contact card (authenticates identity + prekeys);
+        /// lets the callee display/verify the peer without a second exchange.
+        peer_card: ContactCard,
+        /// Index into `bundles` of the one-time prekey bundle consumed by the
+        /// handshake — the caller may securely drop it.
+        bundle_index: usize,
     },
     /// Pairwise plaintext on an existing session (index into `sessions`).
     PairText {
@@ -59,10 +65,7 @@ pub fn encrypt_pair(session: &mut SessionState, plaintext: &[u8]) -> Result<Vec<
     } else {
         let ad = ad_of(EnvType::PairMsg);
         let (header, nonce, ct) = session.encrypt(&ad, plaintext)?;
-        wire::frame(
-            EnvType::PairMsg,
-            &PairMsgPayload { header, nonce, ct },
-        )
+        wire::frame(EnvType::PairMsg, &PairMsgPayload { header, nonce, ct })
     }
 }
 
@@ -95,8 +98,8 @@ pub fn decrypt_pair_env(session: &mut SessionState, env: &[u8]) -> Result<Vec<u8
 pub fn decrypt_any(
     me: &Identity,
     bundles: &[CardBundle],
-    sessions: &mut Vec<SessionState>,
-    groups: &mut Vec<GroupState>,
+    sessions: &mut [SessionState],
+    groups: &mut [GroupState],
     env: &[u8],
 ) -> Result<Inbound> {
     let (t, body) = wire::unframe(env)?;
@@ -108,12 +111,27 @@ pub fn decrypt_any(
         }
         EnvType::PairInit => {
             let p: PairInitPayload = postcard::from_bytes(body).map_err(|_| Error::Serde)?;
-            let mut session = handshake::accept(me, bundles, &p.init)?;
+            let (mut session, bundle_index) = handshake::accept(me, bundles, &p.init)?;
+            // Replay of an already-accepted PairInit: route to the existing
+            // session instead of creating a duplicate — the ratchet's replay
+            // protection then rejects the re-delivered first message.
+            if let Some(idx) = sessions
+                .iter()
+                .position(|s| s.session_id == session.session_id)
+            {
+                let pt = sessions[idx].decrypt(&ad_of(t), &p.header, &p.nonce, &p.ct)?;
+                return Ok(Inbound::PairText {
+                    session_index: idx,
+                    plaintext: pt,
+                });
+            }
             let pt = session.decrypt(&ad_of(t), &p.header, &p.nonce, &p.ct)?;
             session.confirmed = true;
             Ok(Inbound::NewSession {
-                session,
+                session: Box::new(session),
                 plaintext: pt,
+                peer_card: p.init.card,
+                bundle_index,
             })
         }
         EnvType::PairMsg => {
@@ -140,7 +158,20 @@ pub fn decrypt_any(
                 .position(|g| g.group_id == p.group_id)
                 .ok_or(Error::Group("unknown group"))?;
             let g = &mut groups[idx];
-            let pt = g.decrypt(&ad_of(t), p.epoch, &p.sender, p.n, &p.nonce, &p.ct)?;
+            let proof = crate::group::SenderProof {
+                ed: p.sender_ed,
+                x: p.sender_x,
+                sig: p.signature,
+            };
+            let msg = crate::group::InboundMsg {
+                epoch: p.epoch,
+                sender: &p.sender,
+                proof: &proof,
+                n: p.n,
+                nonce: &p.nonce,
+                ct: &p.ct,
+            };
+            let pt = g.decrypt(&ad_of(t), &msg)?;
             Ok(Inbound::GroupText {
                 group_index: idx,
                 sender: p.sender,
@@ -148,13 +179,11 @@ pub fn decrypt_any(
             })
         }
         EnvType::GroupInvite | EnvType::GroupRotate => {
-            let (group_id, _epoch, items) = if t == EnvType::GroupInvite {
-                let p: GroupInvitePayload =
-                    postcard::from_bytes(body).map_err(|_| Error::Serde)?;
+            let (group_id, epoch, items) = if t == EnvType::GroupInvite {
+                let p: GroupInvitePayload = postcard::from_bytes(body).map_err(|_| Error::Serde)?;
                 (p.group_id, p.epoch, p.items)
             } else {
-                let p: GroupRotatePayload =
-                    postcard::from_bytes(body).map_err(|_| Error::Serde)?;
+                let p: GroupRotatePayload = postcard::from_bytes(body).map_err(|_| Error::Serde)?;
                 (p.group_id, p.epoch, p.items)
             };
             let my = me.public_id();
@@ -175,34 +204,51 @@ pub fn decrypt_any(
                 .iter()
                 .position(|s| s.session_id == inner_hdr.header.session_id)
                 .ok_or(Error::Ratchet("no session for invite"))?;
+            let sender_id = sessions[sidx].peer_id;
             let inner_pt = decrypt_pair_env(&mut sessions[sidx], &wrap.env)?;
-            let inner: InviteInner =
-                postcard::from_bytes(&inner_pt).map_err(|_| Error::Serde)?;
+            let inner: InviteInner = postcard::from_bytes(&inner_pt).map_err(|_| Error::Serde)?;
 
-            if t == EnvType::GroupInvite {
-                if let Some(gi) = groups.iter().position(|g| g.group_id == group_id) {
-                    // re-invite on same group id: treat as rotation
-                    groups[gi].apply_rotate(inner.epoch, inner.group_key, inner.members)?;
-                    return Ok(Inbound::GroupRotated { group_index: gi });
+            // Authorization: the wrap must be consistent with the outer
+            // envelope and must come from the *group admin's* pairwise
+            // session — otherwise any contact (or non-admin member) could
+            // force-rotate the group to a key they control.
+            if inner.kind != t as u8 || inner.group_id != group_id || inner.epoch != epoch {
+                return Err(Error::Group("invite/rotate inner mismatch"));
+            }
+            if sender_id != inner.admin {
+                return Err(Error::Group("sender is not the claimed admin"));
+            }
+            if !inner.members.contains(&my) {
+                return Err(Error::Group("we are not in the member list"));
+            }
+
+            if let Some(gi) = groups.iter().position(|g| g.group_id == group_id) {
+                // Re-invite or rotation on an existing group: only the current
+                // admin may change the epoch.
+                if groups[gi].admin != sender_id {
+                    return Err(Error::Group("only admin can rotate"));
                 }
-                let g = GroupState::from_invite(
-                    inner.group_id,
+                groups[gi].apply_rotate(
                     inner.epoch,
                     inner.group_key,
-                    inner.admin,
                     inner.members,
-                    "",
-                    me.public_id(),
-                );
-                Ok(Inbound::GroupJoined(g))
-            } else {
-                let gi = groups
-                    .iter()
-                    .position(|g| g.group_id == group_id)
-                    .ok_or(Error::Group("rotate for unknown group"))?;
-                groups[gi].apply_rotate(inner.epoch, inner.group_key, inner.members)?;
-                Ok(Inbound::GroupRotated { group_index: gi })
+                    &inner.name,
+                )?;
+                return Ok(Inbound::GroupRotated { group_index: gi });
             }
+            if t == EnvType::GroupRotate {
+                return Err(Error::Group("rotate for unknown group"));
+            }
+            let g = GroupState::from_invite(
+                inner.group_id,
+                inner.epoch,
+                inner.group_key,
+                inner.admin,
+                inner.members,
+                &inner.name,
+                me.public_id(),
+            );
+            Ok(Inbound::GroupJoined(g))
         }
     }
 }
@@ -217,7 +263,12 @@ pub fn group_create(
 ) -> Result<(GroupState, Vec<u8>)> {
     let mut g = GroupState::create(me.public_id(), name);
     let mut members = vec![me.public_id()];
-    members.extend_from_slice(member_ids);
+    for mid in member_ids {
+        // dedup + never invite ourselves (no self-session exists to wrap for)
+        if *mid != me.public_id() && !members.contains(mid) {
+            members.push(*mid);
+        }
+    }
     g.members = members.clone();
 
     let inner = InviteInner {
@@ -226,12 +277,23 @@ pub fn group_create(
         epoch: g.epoch,
         group_key: g.k_g,
         admin: me.public_id(),
-        members,
+        members: members.clone(),
+        name: name.to_string(),
     };
     let inner_bytes = postcard::to_allocvec(&inner).map_err(|_| Error::Serde)?;
 
+    // Every member needs an established session: check all of them *before*
+    // producing any wrap, so a missing session fails cleanly instead of
+    // consuming ratchet keys on a subset of sessions for messages that will
+    // never be sent.
+    for mid in members.iter().filter(|m| **m != me.public_id()) {
+        if !sessions.iter().any(|s| &s.peer_id == mid) {
+            return Err(Error::Group("no session for member"));
+        }
+    }
+
     let mut items = Vec::new();
-    for mid in member_ids {
+    for mid in members.iter().filter(|m| **m != me.public_id()) {
         let s = sessions
             .iter_mut()
             .find(|s| &s.peer_id == mid)
@@ -261,19 +323,39 @@ pub fn group_rotate(
     if group.admin != me.public_id() {
         return Err(Error::Group("only admin can rotate"));
     }
-    let new_key = group.rotate(new_members.clone());
+    if !new_members.contains(&me.public_id()) {
+        return Err(Error::Group("admin must remain a member"));
+    }
+    // dedup while preserving order
+    let mut dedup: Vec<[u8; 32]> = Vec::with_capacity(new_members.len());
+    for m in new_members {
+        if !dedup.contains(&m) {
+            dedup.push(m);
+        }
+    }
+    // Every member needs a session — check before rotating, and rotate a
+    // scratch copy: a mid-wrap failure must not leave our local group on an
+    // epoch whose key nobody else received.
+    for mid in dedup.iter().filter(|m| **m != me.public_id()) {
+        if !sessions.iter().any(|s| &s.peer_id == mid) {
+            return Err(Error::Group("no session for member"));
+        }
+    }
+    let mut next = group.clone();
+    let new_key = next.rotate(dedup.clone());
     let inner = InviteInner {
         kind: EnvType::GroupRotate as u8,
-        group_id: group.group_id,
-        epoch: group.epoch,
+        group_id: next.group_id,
+        epoch: next.epoch,
         group_key: new_key,
         admin: me.public_id(),
-        members: new_members.clone(),
+        members: dedup.clone(),
+        name: next.name.clone(),
     };
     let inner_bytes = postcard::to_allocvec(&inner).map_err(|_| Error::Serde)?;
 
     let mut items = Vec::new();
-    for mid in new_members.iter().filter(|m| **m != me.public_id()) {
+    for mid in dedup.iter().filter(|m| **m != me.public_id()) {
         let s = sessions
             .iter_mut()
             .find(|s| &s.peer_id == mid)
@@ -281,29 +363,37 @@ pub fn group_rotate(
         let env = encrypt_pair(s, &inner_bytes)?;
         items.push(MemberWrap { member: *mid, env });
     }
-    wire::frame(
+    let env = wire::frame(
         EnvType::GroupRotate,
         &GroupRotatePayload {
-            group_id: group.group_id,
-            epoch: group.epoch,
+            group_id: next.group_id,
+            epoch: next.epoch,
             items,
         },
-    )
+    )?;
+    *group = next;
+    Ok(env)
 }
 
-/// Encrypt a group message envelope.
-pub fn encrypt_group(group: &mut GroupState, plaintext: &[u8]) -> Result<Vec<u8>> {
+/// Encrypt a group message envelope, signed by our identity key.
+pub fn encrypt_group(me: &Identity, group: &mut GroupState, plaintext: &[u8]) -> Result<Vec<u8>> {
+    if group.my_id != me.public_id() {
+        return Err(Error::Group("group state does not belong to this identity"));
+    }
     let ad = ad_of(EnvType::GroupMsg);
-    let (n, nonce, ct) = group.encrypt(&ad, plaintext);
+    let (n, nonce, ct, signature) = group.encrypt(me, &ad, plaintext);
     wire::frame(
         EnvType::GroupMsg,
         &GroupMsgPayload {
             group_id: group.group_id,
             epoch: group.epoch,
             sender: group.my_id,
+            sender_ed: me.ed_public(),
+            sender_x: me.x_public(),
             n,
             nonce,
             ct,
+            signature,
         },
     )
 }

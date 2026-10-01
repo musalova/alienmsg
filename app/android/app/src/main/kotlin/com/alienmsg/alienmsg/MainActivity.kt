@@ -1,5 +1,7 @@
 package com.alienmsg.alienmsg
 
-import io.flutter.embedding.android.FlutterActivity
+import io.flutter.embedding.android.FlutterFragmentActivity
 
-class MainActivity : FlutterActivity()
+// FragmentActivity is required by local_auth (BiometricPrompt needs a
+// FragmentActivity host to show the fingerprint/system-auth sheet).
+class MainActivity : FlutterFragmentActivity()

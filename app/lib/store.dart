@@ -1,15 +1,14 @@
 import 'dart:convert';
-import 'dart:io';
 
 import 'package:flutter/foundation.dart';
-import 'package:path_provider/path_provider.dart';
 
 import 'api.dart';
+import 'plat.dart' as plat;
 
 class Contact {
   String name;
   final String pubId; // hex owner id from their card
-  final String card; // b64 postcard ContactCard
+  String card; // b64 postcard ContactCard
   bool verified;
   String? session; // b64 SessionState blob
   String? sessionId; // hex
@@ -32,8 +31,8 @@ class Contact {
       };
   static Contact fromJson(Map<String, dynamic> j) => Contact(
         name: j['name'] ?? '',
-        pubId: j['pub_id'],
-        card: j['card'],
+        pubId: j['pub_id'] ?? '',
+        card: j['card'] ?? '',
         verified: j['verified'] ?? false,
         session: j['session'],
         sessionId: j['session_id'],
@@ -48,8 +47,36 @@ class GroupChat {
 
   Map<String, dynamic> toJson() =>
       {'name': name, 'group_id': groupId, 'blob': blob};
-  static GroupChat fromJson(Map<String, dynamic> j) =>
-      GroupChat(name: j['name'] ?? '', groupId: j['group_id'], blob: j['blob']);
+  static GroupChat fromJson(Map<String, dynamic> j) => GroupChat(
+      name: j['name'] ?? '', groupId: j['group_id'] ?? '', blob: j['blob'] ?? '');
+}
+
+/// The vault file is password-protected; [Store.isLocked] is set and the UI
+/// should ask for the password and retry [Store.open].
+class VaultLockedException implements Exception {
+  const VaultLockedException();
+  @override
+  String toString() => 'vault locked';
+}
+
+/// One persisted chat bubble: [mine] aligns right, [system] renders as a
+/// centered notice, [from] shows a sender label on group messages.
+class ChatEntry {
+  final String text;
+  final bool mine;
+  final String? from;
+  final bool system;
+  const ChatEntry(this.text,
+      {this.mine = false, this.from, this.system = false});
+
+  Map<String, dynamic> toJson() =>
+      {'t': text, 'mine': mine, 'from': from, 'sys': system};
+  static ChatEntry fromJson(Map<String, dynamic> j) => ChatEntry(
+        j['t'] as String? ?? '',
+        mine: j['mine'] == true,
+        from: j['from'] as String?,
+        system: j['sys'] == true,
+      );
 }
 
 /// Decrypted inbound item produced by [Store.processInbound].
@@ -64,54 +91,165 @@ class InboundResult {
 class Store extends ChangeNotifier {
   int? _vault;
   String? _vaultPath;
+  bool _locked = false;
+  bool _gated = false; // app gate (PIN/Hello) — separate from vault lock
+  bool vaultProtected = false;
 
   String? identitySeed; // b64 seed
   String? pubId; // hex
+  String? recoveryPhrase; // 24 words, kept for optional backup
   List<String> bundles = []; // b64 CardBundles
   List<Contact> contacts = [];
   List<GroupChat> groups = [];
 
-  bool get isOpen => _vault != null;
-  bool get hasIdentity => identitySeed != null;
+  /// App lock gate: null = open, 'pin' = PIN code, 'hello' = Windows Hello.
+  String? lockMode;
 
-  static Future<String> defaultVaultPath() async {
-    final dir = await getApplicationSupportDirectory();
-    return '${dir.path}${Platform.pathSeparator}alienmsg.vault';
+  bool get isOpen => _vault != null;
+
+  /// The vault exists and is bound to a password we haven't supplied yet.
+  bool get isLocked => _locked;
+
+  /// App-level gate (PIN / Windows Hello): vault is already open but the UI
+  /// asks for authentication before showing anything.
+  bool get isGated => _gated;
+  void gate() {
+    _gated = true;
+    notifyListeners();
   }
 
+  void ungate() {
+    _gated = false;
+    notifyListeners();
+  }
+  String? get vaultPath => _vaultPath;
+  bool get hasIdentity => identitySeed != null;
+
+  static Future<String> defaultVaultPath() => plat.defaultVaultPath();
+
+  /// Sidecar names next to the vault: the wrapped vault password
+  /// (device binding), an optional wrapped PIN, and a Hello marker.
+  static String devkeyPath(String vaultPath) => '$vaultPath.devkey';
+  static String pinPath(String vaultPath) => '$vaultPath.pin';
+  static String helloPath(String vaultPath) => '$vaultPath.hello';
+
+  /// Read + unwrap the device-bound vault password. Returns null when no
+  /// sidecar exists; throws when unwrap fails (vault copied to another
+  /// device/account). Falls back to `devkey.tmp` — bindDevice writes it
+  /// before rekeying, so it holds the *new* password if the app died between
+  /// the vault save and the promote.
+  static Future<String?> devicePassword(String vaultPath) async {
+    final v = await plat.secureRead(vaultPath, 'devkey');
+    if (v != null) return v;
+    return plat.secureRead(vaultPath, 'devkey.tmp');
+  }
+
+  /// Which lock gate is configured for [vaultPath]: 'pin' | 'hello' | null.
+  static Future<String?> detectLockMode(String vaultPath) async {
+    if (await plat.secureRead(vaultPath, 'hello') != null) return 'hello';
+    if (await plat.secureRead(vaultPath, 'pin') != null) return 'pin';
+    return null;
+  }
+
+  /// Open (or create) the vault at [path].
+  ///
+  /// Throws [VaultLockedException] when the file is password-protected and
+  /// `password` is empty — the app should prompt and call [unlock]. Any other
+  /// open failure is treated as corruption: the file is renamed aside (no data
+  /// loss) and a fresh vault is created, so the app can never wedge at boot.
+  /// Note a *wrong* password on a protected vault also throws
+  /// [VaultLockedException] — the file is never renamed under it.
   Future<void> open(String path, String password) async {
-    _vault = AlienApi.vaultOpen(path, password);
     _vaultPath = path;
+    try {
+      final r = AlienApi.vaultOpen(path, password);
+      _vault = r['handle'] as int;
+      vaultProtected = r['protected'] == true;
+    } catch (_) {
+      final probe = AlienApi.vaultProbe(path);
+      if (probe['needs_password'] == true) {
+        // Password-bound vault: it is intact, just locked. Surface the lock
+        // state and let the UI ask for the password — never quarantine it.
+        _locked = true;
+        notifyListeners();
+        throw const VaultLockedException();
+      }
+      // Corrupt vault blob: move it aside (no data loss) and start fresh
+      // instead of leaving the app permanently unable to boot.
+      AlienApi.vaultRename(
+          path, '$path.corrupt-${DateTime.now().millisecondsSinceEpoch}');
+      final r = AlienApi.vaultOpen(path, password);
+      _vault = r['handle'] as int;
+      vaultProtected = r['protected'] == true;
+    }
+    _locked = false;
     _load();
+  }
+
+  /// Retry [open] with the password typed on the lock screen.
+  /// On success, migrates the vault to transparent device-bound unlock by
+  /// writing the DPAPI sidecar (the vault keeps its existing password).
+  Future<void> unlock(String password) async {
+    await open(_vaultPath!, password);
+    await _migrateDeviceKey(password);
+  }
+
+  /// Write the device-bound sidecar wrapping [password] if absent, so the
+  /// vault auto-unlocks on this device next boot.
+  Future<void> _migrateDeviceKey(String password) async {
+    final path = _vaultPath;
+    if (path == null) return;
+    try {
+      if (await devicePassword(path) != null) return;
+    } catch (_) {}
+    await plat.secureWrite(path, 'devkey', password);
+  }
+
+  /// Set or clear (empty string) the vault password. Persists immediately.
+  /// Returns whether the vault is now password-protected.
+  bool setVaultPassword(String password) {
+    vaultProtected = AlienApi.vaultSetPassword(_vault!, _vaultPath!, password);
+    _persist();
+    notifyListeners();
+    return vaultProtected;
+  }
+
+  static T? _decodeVaultJson<T>(String? b64, T Function(dynamic json) f) {
+    if (b64 == null) return null;
+    try {
+      return f(jsonDecode(utf8.decode(base64Decode(b64))));
+    } catch (_) {
+      return null; // corrupt entry: ignore instead of crashing startup
+    }
   }
 
   void _load() {
     identitySeed = AlienApi.vaultGet(_vault!, 'identity');
+    recoveryPhrase = _decodeVaultJson<String?>(
+        AlienApi.vaultGet(_vault!, 'recovery'), (j) => j as String?);
     final meta = AlienApi.vaultGet(_vault!, 'meta');
-    pubId = meta == null ? null : (jsonDecode(utf8.decode(base64Decode(meta)))['pub_id'] as String?);
+    pubId = _decodeVaultJson<String?>(meta, (j) => j['pub_id'] as String?);
     final bundlesJson = AlienApi.vaultGet(_vault!, 'bundles');
-    bundles = bundlesJson == null
-        ? []
-        : (jsonDecode(utf8.decode(base64Decode(bundlesJson))) as List)
-            .cast<String>();
+    bundles = _decodeVaultJson(bundlesJson, (j) => (j as List).cast<String>()) ?? [];
     final contactsJson = AlienApi.vaultGet(_vault!, 'contacts');
-    contacts = contactsJson == null
-        ? []
-        : (jsonDecode(utf8.decode(base64Decode(contactsJson))) as List)
-            .map((e) => Contact.fromJson(e))
-            .toList();
+    contacts = _decodeVaultJson(contactsJson,
+            (j) => (j as List).map((e) => Contact.fromJson(e)).toList()) ??
+        [];
     final groupsJson = AlienApi.vaultGet(_vault!, 'groups');
-    groups = groupsJson == null
-        ? []
-        : (jsonDecode(utf8.decode(base64Decode(groupsJson))) as List)
-            .map((e) => GroupChat.fromJson(e))
-            .toList();
+    groups = _decodeVaultJson(groupsJson,
+            (j) => (j as List).map((e) => GroupChat.fromJson(e)).toList()) ??
+        [];
     notifyListeners();
   }
 
   void _persist() {
-    final v = _vault!;
+    final v = _vault;
+    if (v == null) return; // wiped/closed vault: nothing to persist to
     if (identitySeed != null) AlienApi.vaultSet(v, 'identity', identitySeed!);
+    if (recoveryPhrase != null) {
+      AlienApi.vaultSet(
+          v, 'recovery', base64Encode(utf8.encode(jsonEncode(recoveryPhrase))));
+    }
     AlienApi.vaultSet(
         v,
         'meta',
@@ -134,8 +272,81 @@ class Store extends ChangeNotifier {
     final r = AlienApi.identityCreate(mnemonic, passphrase);
     identitySeed = r['identity'] as String;
     pubId = r['pub_id'] as String;
+    recoveryPhrase = mnemonic;
     _persist();
     notifyListeners();
+  }
+
+  /// Create an identity the user never has to back up: internally it is still
+  /// a BIP-39 phrase (kept encrypted in the vault, shown only on request), but
+  /// nothing is asked or displayed during onboarding.
+  Future<void> createIdentitySimple() async {
+    final m = await AlienApi.generateMnemonic();
+    createIdentity(m, '');
+  }
+
+  /// Bind the vault to this device: replace the vault password with a random
+  /// 256-bit key wrapped by the platform keystore (DPAPI on Windows, Keystore/
+  /// Keychain on mobile) and stored in a sidecar. A copied vault file cannot
+  /// be opened elsewhere.
+  /// Ordered so a crash can never strand the vault: on Windows devkey.tmp
+  /// (new pw) is written BEFORE the rekey and promoted after it; if the vault
+  /// has no password yet, the empty-password devkey is written first as a
+  /// fallback.
+  Future<void> bindDevice() async {
+    final path = _vaultPath;
+    final v = _vault;
+    if (path == null || v == null) return;
+    try {
+      if (await devicePassword(path) == null && !vaultProtected) {
+        await plat.secureWrite(path, 'devkey', '');
+      }
+    } catch (_) {}
+    final devPass = 'dev.${AlienApi.randomBytes(32)}';
+    await plat.secureWrite(path, 'devkey.tmp', devPass);
+    setVaultPassword(devPass); // rekeys + saves the vault
+    await plat.secureWrite(path, 'devkey', devPass);
+    await plat.secureDelete(path, 'devkey.tmp');
+  }
+
+  /// Enable/disable the PIN gate. Null disables.
+  Future<void> setPin(String? pin) async {
+    final path = _vaultPath;
+    if (path == null) return;
+    if (pin == null || pin.isEmpty) {
+      await plat.secureDelete(path, 'pin');
+      lockMode =
+          await plat.secureRead(path, 'hello') != null ? 'hello' : null;
+    } else {
+      await plat.secureWrite(path, 'pin', 'pin.$pin');
+      lockMode = 'pin';
+    }
+    notifyListeners();
+  }
+
+  /// Enable/disable Windows Hello / biometrics as the unlock gate.
+  Future<void> setHello(bool on) async {
+    final path = _vaultPath;
+    if (path == null) return;
+    if (on) {
+      await plat.secureWrite(path, 'hello', 'hello');
+      lockMode = 'hello';
+    } else {
+      await plat.secureDelete(path, 'hello');
+      lockMode = await plat.secureRead(path, 'pin') != null ? 'pin' : null;
+    }
+    notifyListeners();
+  }
+
+  /// Verify a PIN attempt against the stored PIN.
+  Future<bool> checkPin(String pin) async {
+    final path = _vaultPath;
+    if (path == null) return false;
+    try {
+      return await plat.secureRead(path, 'pin') == 'pin.$pin';
+    } catch (_) {
+      return false;
+    }
   }
 
   /// Generate a fresh single-use contact card (also persists its bundle).
@@ -201,7 +412,7 @@ class Store extends ChangeNotifier {
 
   /// Encrypt to group; returns rendered output text.
   String encryptGroup(GroupChat g, String plaintext, String format) {
-    final r = AlienApi.groupEncrypt(g.blob, plaintext);
+    final r = AlienApi.groupEncrypt(identitySeed!, g.blob, plaintext);
     g.blob = r['group'] as String;
     _persist();
     return AlienApi.render(r['envelope'] as String, format);
@@ -241,15 +452,25 @@ class Store extends ChangeNotifier {
       case 'new_session':
         {
           final peerId = r['peer_id'] as String;
+          final peerCard = r['peer_card'] as String? ?? '';
+          // The one-time prekey bundle targeted by this handshake has been
+          // consumed: dropping it improves forward secrecy of the pairing.
+          final consumed = r['consumed_bundle'];
+          if (consumed is int && consumed >= 0 && consumed < bundles.length) {
+            bundles.removeAt(consumed);
+          }
           final idx = contacts.indexWhere((c) => c.pubId == peerId);
           if (idx >= 0) {
             contacts[idx].session = r['session'] as String;
+            contacts[idx].sessionId = r['session_id'] as String?;
+            if (peerCard.isNotEmpty) contacts[idx].card = peerCard;
           } else {
             contacts.add(Contact(
               name: 'Contatto ${peerId.substring(0, 8)}',
               pubId: peerId,
-              card: '', // we don't have their card blob here; pairing material came via init
+              card: peerCard,
               session: r['session'] as String,
+              sessionId: r['session_id'] as String?,
             ));
           }
           _persist();
@@ -267,15 +488,20 @@ class Store extends ChangeNotifier {
         }
       case 'group_joined':
         {
+          final gid = r['group_id'] as String;
+          final name = r['name'] as String?;
           groups.add(GroupChat(
-            name: 'Gruppo ${(r['group_id'] as String).substring(0, 8)}',
-            groupId: r['group_id'] as String,
+            name: (name != null && name.isNotEmpty)
+                ? name
+                : 'Gruppo ${gid.substring(0, 8)}',
+            groupId: gid,
             blob: r['group'] as String,
           ));
           _writeBackSessions(r['sessions'] as List);
           _persist();
           notifyListeners();
-          return InboundResult('info', 'Aggiunto al gruppo',
+          return InboundResult('info',
+              'Sei entrato nel gruppo "${groups.last.name}"',
               groupId: r['group_id'] as String);
         }
       case 'group_rotated':
@@ -331,17 +557,89 @@ class Store extends ChangeNotifier {
     return AlienApi.render(r['envelope'] as String, 'blob');
   }
 
-  void wipe() {
-    // Overwrite-and-remove is best-effort on flash storage; the vault itself
-    // is encrypted, so deleting the file plus closing suffices for app-level
-    // hygiene.
+  // --- chat history (kept in the encrypted vault) ---
+
+  static String historyKeyForContact(String pubId) => 'hist.p.$pubId';
+  static String historyKeyForGroup(String groupId) => 'hist.g.$groupId';
+
+  /// Load the stored bubbles for a conversation (newest last, max 200).
+  List<ChatEntry> history(String key) {
+    final v = _vault;
+    if (v == null) return [];
+    return _decodeVaultJson<List<ChatEntry>>(
+            AlienApi.vaultGet(v, key),
+            (j) => (j as List)
+                .map((e) => ChatEntry.fromJson(e as Map<String, dynamic>))
+                .toList()) ??
+        [];
+  }
+
+  /// Append a bubble to the conversation and persist it (FIFO cap 200).
+  void logMessage(String key, ChatEntry entry) {
+    final v = _vault;
+    if (v == null) return;
+    final list = history(key)..add(entry);
+    final trimmed =
+        list.length > 200 ? list.sublist(list.length - 200) : list;
+    AlienApi.vaultSet(
+        v, key, base64Encode(utf8.encode(jsonEncode(trimmed))));
+    if (_vaultPath != null) AlienApi.vaultSave(v, _vaultPath!);
+  }
+
+  /// Remove a contact together with its session state (the session blob is
+  /// dropped from the vault on the next persist — forward secrecy by deletion).
+  void deleteContact(Contact c) {
+    contacts.removeWhere((x) => x.pubId == c.pubId);
+    final v = _vault;
+    if (v != null) AlienApi.vaultRemove(v, historyKeyForContact(c.pubId));
+    _persist();
+    notifyListeners();
+  }
+
+  /// Remove a group locally. Other members are NOT notified — the group admin
+  /// should rotate the key without us to actually revoke read access.
+  void deleteGroup(GroupChat g) {
+    groups.removeWhere((x) => x.groupId == g.groupId);
+    final v = _vault;
+    if (v != null) AlienApi.vaultRemove(v, historyKeyForGroup(g.groupId));
+    _persist();
+    notifyListeners();
+  }
+
+  /// Close the vault AND delete the vault file. Without the delete the
+  /// identity seed would stay on disk (decryptable for plain v1 vaults),
+  /// which would make "Cancella dati" a lie.
+  Future<void> wipe() async {
     if (_vault != null) AlienApi.vaultClose(_vault!);
     _vault = null;
+    _locked = false;
+    _gated = false;
+    vaultProtected = false;
     identitySeed = null;
     pubId = null;
+    recoveryPhrase = null;
+    lockMode = null;
     bundles = [];
     contacts = [];
     groups = [];
+    final path = _vaultPath;
+    if (path != null) {
+      try {
+        AlienApi.vaultDelete(path);
+      } catch (_) {}
+      for (final name in ['devkey', 'devkey.tmp', 'pin', 'hello']) {
+        try {
+          await plat.secureDelete(path, name);
+        } catch (_) {}
+      }
+      // Reopen a fresh vault so the next identity creation can persist —
+      // otherwise the store would sit on a null vault and never save.
+      try {
+        final r = AlienApi.vaultOpen(path, '');
+        _vault = r['handle'] as int;
+        vaultProtected = r['protected'] == true;
+      } catch (_) {}
+    }
     notifyListeners();
   }
 }

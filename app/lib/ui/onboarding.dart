@@ -1,8 +1,8 @@
 import 'package:flutter/material.dart';
 
 import '../api.dart';
+import '../logo.dart';
 import '../store.dart';
-import '../main.dart' show copyToClipboard;
 
 class OnboardingScreen extends StatefulWidget {
   const OnboardingScreen({super.key});
@@ -11,10 +11,9 @@ class OnboardingScreen extends StatefulWidget {
 }
 
 class _OnboardingScreenState extends State<OnboardingScreen> {
-  String? _mnemonic;
   final _restoreCtrl = TextEditingController();
   final _passCtrl = TextEditingController();
-  bool _confirmed = false;
+  bool _busy = false;
   String? _error;
 
   @override
@@ -24,23 +23,38 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
     super.dispose();
   }
 
-  Future<void> _generate() async {
-    final m = await AlienApi.generateMnemonic();
-    setState(() => _mnemonic = m);
+  /// One-tap registration: identity generated internally, vault bound to this
+  /// device. Nothing to write down or remember.
+  Future<void> _create() async {
+    setState(() => _busy = true);
+    try {
+      await store.createIdentitySimple();
+      await store.bindDevice();
+    } catch (_) {
+      if (mounted) setState(() => _error = 'Qualcosa è andato storto. Riprova.');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
   }
 
-  void _create() {
-    if (_mnemonic == null || !_confirmed) return;
-    store.createIdentity(_mnemonic!, _passCtrl.text);
-  }
-
-  void _restore() {
+  Future<void> _restore() async {
     final phrase = _restoreCtrl.text.trim();
     if (!AlienApi.validateMnemonic(phrase)) {
       setState(() => _error = 'Frase non valida (checksum errato)');
       return;
     }
-    store.createIdentity(phrase, _passCtrl.text);
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      store.createIdentity(phrase, _passCtrl.text);
+      await store.bindDevice();
+    } catch (_) {
+      if (mounted) setState(() => _error = 'Qualcosa è andato storto. Riprova.');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
   }
 
   @override
@@ -54,109 +68,77 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
               padding: const EdgeInsets.all(24),
               shrinkWrap: true,
               children: [
-                const Icon(Icons.lock_outline, size: 56),
-                const SizedBox(height: 12),
+                const AlienLogo(size: 88),
+                const SizedBox(height: 16),
                 Text('AlienMsg',
                     textAlign: TextAlign.center,
                     style: Theme.of(context).textTheme.headlineMedium),
                 const SizedBox(height: 8),
                 Text(
-                  'Cifratura end-to-end post-quantum.\nI messaggi si incollano in qualsiasi app.',
+                  'Messaggi che nessuno può leggere.\nLi incolli in qualsiasi app: SMS, chat, email.',
                   textAlign: TextAlign.center,
                   style: Theme.of(context).textTheme.bodyMedium,
                 ),
                 const SizedBox(height: 32),
-                if (_mnemonic == null) ...[
-                  FilledButton.icon(
-                    onPressed: _generate,
-                    icon: const Icon(Icons.add),
-                    label: const Text('Genera nuova identità'),
+                FilledButton.icon(
+                  style:
+                      FilledButton.styleFrom(padding: const EdgeInsets.all(16)),
+                  onPressed: _busy ? null : _create,
+                  icon: const Icon(Icons.add),
+                  label: Text(
+                      _busy ? 'Creazione in corso…' : 'Inizia — crea il tuo profilo',
+                      style: const TextStyle(fontSize: 16)),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  'Il profilo resta su questo dispositivo, protetto dal sistema.\n'
+                  'Potrai aggiungere un PIN o l\'impronta dalle Impostazioni.',
+                  textAlign: TextAlign.center,
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+                if (_error != null)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 8),
+                    child: Text(_error!,
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                            color: Theme.of(context).colorScheme.error)),
                   ),
-                  const SizedBox(height: 24),
-                  const Divider(),
-                  const SizedBox(height: 16),
-                  Text('Ripristina da frase di recupero',
-                      style: Theme.of(context).textTheme.titleSmall),
-                  const SizedBox(height: 8),
-                  TextField(
-                    controller: _restoreCtrl,
-                    maxLines: 3,
-                    decoration: const InputDecoration(
-                      border: OutlineInputBorder(),
-                      hintText: '24 parole separate da spazi…',
-                    ),
-                  ),
-                  if (_error != null)
-                    Padding(
-                      padding: const EdgeInsets.only(top: 8),
-                      child: Text(_error!,
-                          style: TextStyle(
-                              color: Theme.of(context).colorScheme.error)),
-                    ),
-                  const SizedBox(height: 8),
-                  OutlinedButton(
-                    onPressed: _restore,
-                    child: const Text('Ripristina identità'),
-                  ),
-                ] else ...[
-                  Text('La tua frase di recupero',
-                      style: Theme.of(context).textTheme.titleMedium),
-                  const SizedBox(height: 4),
-                  const Text(
-                      'Scrivila su carta e conservala al sicuro. Chi la possiede '
-                      'controlla la tua identità. I messaggi passati restano '
-                      'protetti dal forward secrecy.'),
-                  const SizedBox(height: 12),
-                  Container(
-                    padding: const EdgeInsets.all(16),
-                    decoration: BoxDecoration(
-                      border: Border.all(color: Colors.white24),
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                    child: SelectableText(
-                      _mnemonic!,
-                      style: const TextStyle(
-                          fontFamily: 'monospace', fontSize: 15, height: 1.6),
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  Row(children: [
-                    Expanded(
-                      child: OutlinedButton.icon(
-                        onPressed: () =>
-                            copyToClipboard(context, _mnemonic!, 'Frase copiata'),
-                        icon: const Icon(Icons.copy),
-                        label: const Text('Copia frase'),
+                const SizedBox(height: 24),
+                ExpansionTile(
+                  tilePadding: EdgeInsets.zero,
+                  title: const Text('Opzioni avanzate'),
+                  children: [
+                    const SizedBox(height: 4),
+                    Text('Ripristina da frase di recupero',
+                        style: Theme.of(context).textTheme.titleSmall),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: _restoreCtrl,
+                      maxLines: 3,
+                      decoration: const InputDecoration(
+                        border: OutlineInputBorder(),
+                        hintText: 'Le 24 parole separate da spazi…',
                       ),
                     ),
-                  ]),
-                  const SizedBox(height: 16),
-                  TextField(
-                    controller: _passCtrl,
-                    obscureText: true,
-                    decoration: const InputDecoration(
-                      border: OutlineInputBorder(),
-                      labelText: 'Parola extra opzionale (25ª parola)',
-                      helperText: 'Rende la frase inutile a chi la trova',
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: _passCtrl,
+                      obscureText: true,
+                      decoration: const InputDecoration(
+                        border: OutlineInputBorder(),
+                        labelText: 'Parola extra (se la usavi)',
+                        helperText: 'Senza di essa otterrai un profilo DIVERSO',
+                      ),
                     ),
-                  ),
-                  CheckboxListTile(
-                    value: _confirmed,
-                    onChanged: (v) => setState(() => _confirmed = v ?? false),
-                    title: const Text('Ho conservato la frase in sicurezza'),
-                    controlAffinity: ListTileControlAffinity.leading,
-                    contentPadding: EdgeInsets.zero,
-                  ),
-                  FilledButton.icon(
-                    onPressed: _confirmed ? _create : null,
-                    icon: const Icon(Icons.check),
-                    label: const Text('Crea identità'),
-                  ),
-                  TextButton(
-                    onPressed: () => setState(() => _mnemonic = null),
-                    child: const Text('Indietro'),
-                  ),
-                ],
+                    const SizedBox(height: 8),
+                    OutlinedButton(
+                      onPressed: _busy ? null : _restore,
+                      child: const Text('Ripristina'),
+                    ),
+                    const SizedBox(height: 8),
+                  ],
+                ),
               ],
             ),
           ),

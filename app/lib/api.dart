@@ -10,14 +10,30 @@ class AlienApi {
       true;
 
   /// Returns {identity (b64 seed), pub_id, ed_pub, x_pub}.
+  /// Pass [seedB64] (32 bytes) for a caller-supplied device-bound seed, or
+  /// [mnemonic] for phrase-derived identity.
   static Map<String, dynamic> identityCreate(String mnemonic,
-      [String passphrase = '']) {
+      [String passphrase = '', String? seedB64]) {
     return AlienFfi.call({
       'op': 'identity_create',
       'mnemonic': mnemonic,
       'passphrase': passphrase,
+      if (seedB64 != null) 'seed_b64': seedB64,
     });
   }
+
+  /// OS CSPRNG bytes (b64).
+  static String randomBytes([int n = 32]) =>
+      AlienFfi.call({'op': 'random_bytes', 'n': n})['bytes'] as String;
+
+  /// Windows DPAPI (current-user scope). Output only unwraps under the same
+  /// Windows account — binds data to this device.
+  static String dpapiWrap(String dataB64) =>
+      AlienFfi.call({'op': 'dpapi_wrap', 'data': dataB64})['wrapped'] as String;
+
+  static String dpapiUnwrap(String wrappedB64) =>
+      AlienFfi.call({'op': 'dpapi_unwrap', 'data': wrappedB64})['bytes']
+          as String;
 
   /// Returns {card_envelope, card, bundle, card_id, owner_id}.
   static Map<String, dynamic> cardCreate(String identityB64) =>
@@ -96,10 +112,16 @@ class AlienApi {
   static Map<String, dynamic> groupInfo(String groupB64) =>
       AlienFfi.call({'op': 'group_info', 'group': groupB64});
 
-  /// Returns {group (updated), envelope}.
-  static Map<String, dynamic> groupEncrypt(String groupB64, String plaintext) =>
-      AlienFfi.call(
-          {'op': 'group_encrypt', 'group': groupB64, 'plaintext': plaintext});
+  /// Returns {group (updated), envelope}. The message is signed with our
+  /// long-term identity key so members can authenticate the sender.
+  static Map<String, dynamic> groupEncrypt(
+          String identityB64, String groupB64, String plaintext) =>
+      AlienFfi.call({
+        'op': 'group_encrypt',
+        'identity': identityB64,
+        'group': groupB64,
+        'plaintext': plaintext
+      });
 
   /// format: 'blob' | 'emoji' | 'words'
   static String render(String bytesB64, String format) =>
@@ -112,9 +134,23 @@ class AlienApi {
 
   // --- vault ---
 
-  static int vaultOpen(String path, String password) =>
-      AlienFfi.call({'op': 'vault_open', 'path': path, 'password': password})[
-          'handle'] as int;
+  /// Returns {handle, protected}.
+  static Map<String, dynamic> vaultOpen(String path, String password) =>
+      AlienFfi.call({'op': 'vault_open', 'path': path, 'password': password});
+
+  /// Read vault metadata without unlocking: {exists, needs_password}.
+  static Map<String, dynamic> vaultProbe(String path) =>
+      AlienFfi.call({'op': 'vault_probe', 'path': path});
+
+  /// Re-key the vault with a new password (empty removes protection) and save.
+  static bool vaultSetPassword(int handle, String path, String password) =>
+      AlienFfi.call({
+        'op': 'vault_set_password',
+        'handle': handle,
+        'path': path,
+        'password': password,
+      })['protected'] ==
+      true;
 
   static void vaultSet(int handle, String key, String valueB64) =>
       AlienFfi.call(
@@ -138,4 +174,14 @@ class AlienApi {
 
   static void vaultClose(int handle) =>
       AlienFfi.call({'op': 'vault_close', 'handle': handle});
+
+  /// Delete the vault blob at [path] (fs file natively, storage key on web).
+  /// Missing is not an error.
+  static void vaultDelete(String path) =>
+      AlienFfi.call({'op': 'vault_delete', 'path': path});
+
+  /// Rename/quarantine the vault blob at [from] to [to]. Missing source is
+  /// not an error.
+  static void vaultRename(String from, String to) =>
+      AlienFfi.call({'op': 'vault_rename', 'path': from, 'to': to});
 }

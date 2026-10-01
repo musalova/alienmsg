@@ -43,7 +43,11 @@ fn mix_root(
     ikm.extend_from_slice(dh3);
     ikm.extend_from_slice(ss_pq);
     let hk = Hkdf::<Sha256>::new(Some(b"AlienMsg/PQXDH/v1"), &ikm);
-    let (lo, hi) = if id_a < id_b { (id_a, id_b) } else { (id_b, id_a) };
+    let (lo, hi) = if id_a < id_b {
+        (id_a, id_b)
+    } else {
+        (id_b, id_a)
+    };
     let mut info = Vec::with_capacity(64 + 32);
     info.extend_from_slice(b"AlienMsg/root/v1");
     info.extend_from_slice(lo);
@@ -62,6 +66,13 @@ pub fn initiate(
     peer_card: &ContactCard,
 ) -> Result<SessionState> {
     peer_card.verify()?;
+    // Our card is embedded verbatim in the PairInit; it must be valid and
+    // actually belong to this identity, or the peer will see a session from
+    // the wrong (or corrupt) owner.
+    my_card.verify()?;
+    if my_card.owner_id() != me.public_id() {
+        return Err(Error::InvalidCard);
+    }
 
     let eph = StaticSecret::random_from_rng(OsRng);
     let eph_pub = PublicKey::from(&eph);
@@ -74,17 +85,14 @@ pub fn initiate(
         .diffie_hellman(&PublicKey::from(peer_card.spk_x))
         .to_bytes();
 
-    let ek_bytes: ml_kem::Encoded<
-        ml_kem::kem::EncapsulationKey<ml_kem::MlKem1024Params>,
-    > = peer_card
-        .pq_ek
-        .as_slice()
-        .try_into()
-        .map_err(|_| Error::InvalidCard)?;
+    let ek_bytes: ml_kem::Encoded<ml_kem::kem::EncapsulationKey<ml_kem::MlKem1024Params>> =
+        peer_card
+            .pq_ek
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::InvalidCard)?;
     let ek = ml_kem::kem::EncapsulationKey::<ml_kem::MlKem1024Params>::from_bytes(&ek_bytes);
-    let (pq_ct, ss_pq) = ek
-        .encapsulate(&mut OsRng)
-        .map_err(|_| Error::Kem)?;
+    let (pq_ct, ss_pq) = ek.encapsulate(&mut OsRng).map_err(|_| Error::Kem)?;
 
     let peer_id = peer_card.owner_id();
     let root = mix_root(&dh1, &dh2, &dh3, &ss_pq, &me.public_id(), &peer_id)?;
@@ -108,16 +116,23 @@ pub fn initiate(
 
 /// Responder side: reconstruct the root from the initiator's pending data and
 /// the private bundle matching `pending.recipient_card_id`.
+/// Returns `(session, consumed_bundle_index)` — the index lets the caller
+/// drop the one-time prekey bundle once the session is established.
 pub fn accept(
     me: &Identity,
     bundles: &[CardBundle],
     pending: &PendingInit,
-) -> Result<SessionState> {
+) -> Result<(SessionState, usize)> {
     pending.card.verify()?;
-    let bundle = bundles
+    let bundle_index = bundles
         .iter()
-        .find(|b| b.card.card_id == pending.recipient_card_id)
+        .position(|b| b.card.card_id == pending.recipient_card_id)
         .ok_or(Error::InvalidCard)?;
+    let bundle = &bundles[bundle_index];
+    // Sanity: the bundle must actually be ours.
+    if bundle.card.owner_id() != me.public_id() {
+        return Err(Error::InvalidCard);
+    }
 
     let spk = bundle.spk_secret();
 
@@ -125,9 +140,7 @@ pub fn accept(
         .diffie_hellman(&PublicKey::from(pending.card.identity_x))
         .to_bytes();
     let dh2 = me.dh(&pending.eph);
-    let dh3 = spk
-        .diffie_hellman(&PublicKey::from(pending.eph))
-        .to_bytes();
+    let dh3 = spk.diffie_hellman(&PublicKey::from(pending.eph)).to_bytes();
 
     let dk = bundle.decapsulation_key();
     let ct_bytes: ml_kem::Ciphertext<MlKem1024> = pending
@@ -140,18 +153,26 @@ pub fn accept(
     let peer_id = pending.card.owner_id();
     let root = mix_root(&dh1, &dh2, &dh3, &ss_pq, &peer_id, &me.public_id())?;
 
-    Ok(SessionState::init_bob(
-        root,
-        bundle.spk_secret_bytes(),
-        me.public_id(),
-        peer_id,
-        pending.card.identity_ed,
+    Ok((
+        SessionState::init_bob(
+            root,
+            bundle.spk_secret_bytes(),
+            me.public_id(),
+            peer_id,
+            pending.card.identity_ed,
+        ),
+        bundle_index,
     ))
 }
 
 /// Fingerprint string both sides can compare out-of-band (QR / in person).
 /// Order-independent: same output for both peers.
-pub fn safety_fingerprint(id_a: &[u8; 32], ed_a: &[u8; 32], id_b: &[u8; 32], ed_b: &[u8; 32]) -> String {
+pub fn safety_fingerprint(
+    id_a: &[u8; 32],
+    ed_a: &[u8; 32],
+    id_b: &[u8; 32],
+    ed_b: &[u8; 32],
+) -> String {
     use sha2::Digest;
     let pair = |id: &[u8; 32], ed: &[u8; 32]| {
         let mut v = Vec::with_capacity(64);
@@ -177,5 +198,3 @@ pub fn safety_fingerprint(id_a: &[u8; 32], ed_a: &[u8; 32], id_b: &[u8; 32], ed_
     }
     out
 }
-
-

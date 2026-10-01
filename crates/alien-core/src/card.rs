@@ -58,12 +58,7 @@ impl ContactCard {
 
     /// Stable id of the card's owner (must match `Identity::public_id`).
     pub fn owner_id(&self) -> [u8; 32] {
-        use sha2::{Digest, Sha256};
-        let mut h = Sha256::new();
-        h.update(b"alienmsg/pubid/v1");
-        h.update(self.identity_ed);
-        h.update(self.identity_x);
-        h.finalize().into()
+        identity::public_id_of(&self.identity_ed, &self.identity_x)
     }
 }
 
@@ -87,17 +82,33 @@ impl CardBundle {
         postcard::to_allocvec(self).map_err(|_| Error::Serde)
     }
     pub fn from_bytes(b: &[u8]) -> Result<CardBundle> {
-        postcard::from_bytes(b).map_err(|_| Error::Serde)
+        let b2: CardBundle = postcard::from_bytes(b).map_err(|_| Error::Serde)?;
+        // Length-check up front: decapsulation_key() converts pq_dk via
+        // try_into().expect() — a malformed blob would panic otherwise.
+        // ML-KEM-1024 decapsulation key = 3168 bytes.
+        if b2.pq_dk.len() != 3168 {
+            return Err(Error::InvalidCard);
+        }
+        Ok(b2)
     }
     pub fn pq_dk_bytes(&self) -> &[u8] {
         &self.pq_dk
     }
-    pub fn decapsulation_key(
-        &self,
-    ) -> ml_kem::kem::DecapsulationKey<ml_kem::MlKem1024Params> {
-        let enc: ml_kem::Encoded<ml_kem::kem::DecapsulationKey<ml_kem::MlKem1024Params>> =
-            self.pq_dk.as_slice().try_into().expect("pq_dk length checked at build");
+    pub fn decapsulation_key(&self) -> ml_kem::kem::DecapsulationKey<ml_kem::MlKem1024Params> {
+        let enc: ml_kem::Encoded<ml_kem::kem::DecapsulationKey<ml_kem::MlKem1024Params>> = self
+            .pq_dk
+            .as_slice()
+            .try_into()
+            .expect("pq_dk length checked at build");
         ml_kem::kem::DecapsulationKey::from_bytes(&enc)
+    }
+}
+
+impl Drop for CardBundle {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.spk_secret.zeroize();
+        self.pq_dk.zeroize();
     }
 }
 
