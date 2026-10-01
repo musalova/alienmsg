@@ -17,7 +17,9 @@ jobs:
         with:
           toolchain: stable
           targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
-      - uses: android-actions/setup-android@v3
+      # windows-latest ships with the Android SDK at %ANDROID_HOME% —
+      # setup-android is unnecessary and currently breaks (sdkmanager can't
+      # find the legacy 'tools' package).
       - name: Rust libs (Windows + Android)
         run: |
           cargo install cargo-ndk
