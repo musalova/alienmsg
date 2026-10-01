@@ -7,7 +7,9 @@ app/android/build/
 app/android/app/build/
 app/.dart_tool/
 app/.flutter-plugins*
-app/windows/flutter/
+# Only the ephemeral outputs are generated; CMakeLists.txt under
+# windows/flutter must be committed (the Windows build needs it).
+app/windows/flutter/ephemeral/
 app/android/.gradle/
 app/android/app/src/main/jniLibs/
 app/ios/Pods/
