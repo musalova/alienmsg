@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 import 'package:local_auth/local_auth.dart';
 
 import 'ffi.dart';
+import 'plat.dart' as plat;
 import 'store.dart';
 import 'update.dart';
 import 'ui/onboarding.dart';
@@ -57,6 +58,7 @@ class _BootState extends State<_Boot> {
     final t0 = DateTime.now();
     try {
       await AlienFfi.init();
+      await plat.secureReady(); // web: IndexedDB key + legacy migration
     } catch (_) {
       // WASM/native backend failed to load — the splash stays up with an
       // error rather than the app half-booting into broken crypto.
@@ -64,28 +66,38 @@ class _BootState extends State<_Boot> {
       return;
     }
     final path = await Store.defaultVaultPath();
+    store.prepareVaultPath(path);
 
-    // Device-bound vault: the keystore sidecar unwraps the vault password
-    // transparently on this device only.
-    String? pw;
+    // Device-bound vault: the sidecar either holds the vault password
+    // (device-bound, opens transparently) or a `pin:`-wrapped blob that
+    // cryptographically requires the user's PIN before the vault can open.
+    String? devkey;
     try {
-      pw = await Store.devicePassword(path);
+      devkey = await Store.devicePassword(path);
     } catch (_) {
       // Sidecar unreadable (vault copied from another device): legacy lock.
     }
 
-    try {
-      await store.open(path, pw ?? '');
-      if (!store.isLocked && pw == null && store.hasIdentity) {
-        await store.bindDevice();
+    if (devkey != null && devkey.startsWith(Store.pinPrefix)) {
+      store.needsPinToOpen = true;
+      store.lockMode = 'pin';
+    } else {
+      try {
+        await store.open(path, devkey ?? '');
+        if (!store.isLocked && devkey == null && store.hasIdentity) {
+          await store.bindDevice();
+        }
+      } on VaultLockedException {
+        // Legacy password vault: LockScreen asks for the password.
       }
-    } on VaultLockedException {
-      // Legacy password vault: LockScreen asks for the password.
     }
 
-    if (!store.isLocked) {
+    if (!store.isLocked && !store.needsPinToOpen) {
       store.lockMode = await Store.detectLockMode(path);
       if (store.lockMode != null) store.gate();
+      // Web: another tab writing the vault would silently diverge state —
+      // reload our in-memory copy instead.
+      plat.onVaultChanged(() => store.reloadFromStorage());
     }
 
     // Keep the intro on screen long enough to read as an intro.
@@ -124,7 +136,7 @@ class _BootState extends State<_Boot> {
       animation: store,
       builder: (_, __) {
         if (store.isLocked) return const LockScreen();
-        if (store.isGated) return const GateScreen();
+        if (store.needsPinToOpen || store.isGated) return const GateScreen();
         return store.hasIdentity
             ? const HomeScreen()
             : const OnboardingScreen();
@@ -303,7 +315,10 @@ class _GateScreenState extends State<GateScreen> {
       _error = null;
     });
     try {
-      if (await store.checkPin(_pinCtrl.text)) {
+      final ok = store.needsPinToOpen
+          ? await _unlockPinFirst(_pinCtrl.text)
+          : await store.checkPin(_pinCtrl.text);
+      if (ok) {
         store.ungate();
         return;
       }
@@ -317,6 +332,19 @@ class _GateScreenState extends State<GateScreen> {
       }
     } finally {
       if (mounted) setState(() => _waiting = false);
+    }
+  }
+
+  /// PIN-wrapped device key: the PIN unwraps it cryptographically and the
+  /// vault opens directly — a wrong PIN simply fails AEAD, so no PIN value
+  /// or hash is ever stored anywhere.
+  Future<bool> _unlockPinFirst(String pin) async {
+    try {
+      await store.unlockWithPin(pin);
+      plat.onVaultChanged(() => store.reloadFromStorage());
+      return true;
+    } catch (_) {
+      return false;
     }
   }
 
@@ -391,10 +419,17 @@ class _GateScreenState extends State<GateScreen> {
   }
 }
 
-/// Copy helper used across screens.
-void copyToClipboard(BuildContext context, String text, [String? label]) {
-  Clipboard.setData(ClipboardData(text: text));
-  ScaffoldMessenger.of(context).showSnackBar(
-    SnackBar(content: Text(label ?? 'Copiato negli appunti')),
-  );
+/// Copy helper used across screens. Web/Safari can deny programmatic
+/// clipboard writes — report honestly instead of lying "copied".
+Future<void> copyToClipboard(BuildContext context, String text,
+    [String? label]) async {
+  String msg = label ?? 'Copiato negli appunti';
+  try {
+    await Clipboard.setData(ClipboardData(text: text));
+  } catch (_) {
+    msg = 'Copia automatica non riuscita — seleziona il testo a mano';
+  }
+  if (context.mounted) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
 }

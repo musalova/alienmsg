@@ -340,3 +340,56 @@ impl Drop for Vault {
         }
     }
 }
+
+// --- PIN-wrapped secrets ---------------------------------------------------
+//
+// A small standalone envelope to protect a secret (the device key) with a
+// user PIN: `ALNP || salt(16) || nonce(24) || XChaCha20-Poly1305(secret)`.
+// Key = Argon2id(pin, salt) — same derivation strength as the vault itself.
+// Wrong PIN = AEAD failure, so verification is cryptographic: nothing needs
+// to be stored in plaintext to check the PIN.
+
+const PIN_MAGIC: &[u8; 4] = b"ALNP";
+
+/// Wrap `data` under `pin`. Output is self-contained (salt + nonce inside).
+pub fn pin_wrap(pin: &str, data: &[u8]) -> Result<Vec<u8>, StoreError> {
+    let salt: [u8; 16] = rand::random();
+    let nonce: [u8; 24] = rand::random();
+    let key = derive_key(pin, &salt)?;
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
+    let ct = cipher
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: data,
+                aad: PIN_MAGIC,
+            },
+        )
+        .map_err(|_| StoreError::Decrypt)?;
+    let mut out = Vec::with_capacity(4 + 16 + 24 + ct.len());
+    out.extend_from_slice(PIN_MAGIC);
+    out.extend_from_slice(&salt);
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+/// Unwrap a [`pin_wrap`] blob. Wrong PIN or corrupt data → `Err(Decrypt)`.
+pub fn pin_unwrap(pin: &str, blob: &[u8]) -> Result<Vec<u8>, StoreError> {
+    if blob.len() < 4 + 16 + 24 + 16 || &blob[..4] != PIN_MAGIC {
+        return Err(StoreError::Decrypt);
+    }
+    let salt: &[u8; 16] = blob[4..20].try_into().unwrap();
+    let nonce: &[u8; 24] = blob[20..44].try_into().unwrap();
+    let key = derive_key(pin, salt)?;
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
+    cipher
+        .decrypt(
+            XNonce::from_slice(nonce),
+            Payload {
+                msg: &blob[44..],
+                aad: PIN_MAGIC,
+            },
+        )
+        .map_err(|_| StoreError::Decrypt)
+}

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../api.dart';
+import '../main.dart' show copyToClipboard;
 import '../store.dart';
 import 'chat_panel.dart';
 
@@ -117,18 +118,46 @@ class GroupScreen extends StatelessWidget {
     try {
       final keep = all.where((id) => id != removeId).toList();
       final blob = store.rotateGroup(group, keep);
-      Clipboard.setData(ClipboardData(text: blob));
+      bool copied = true;
+      try {
+        Clipboard.setData(ClipboardData(text: blob));
+      } catch (_) {
+        copied = false; // web clipboard can be denied: show the code instead
+      }
       if (dialogCtx.mounted) {
         Navigator.pop(dialogCtx);
         await showDialog(
           context: dialogCtx,
           builder: (ctx2) => AlertDialog(
             title: const Text('Membro rimosso'),
-            content: const Text(
-                'Ho copiato un codice di aggiornamento: incollalo nel gruppo. '
-                'Gli altri membri passeranno alle nuove chiavi e chi è uscito '
-                'non potrà più leggere.'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(copied
+                    ? 'Ho copiato un codice di aggiornamento: incollalo nel '
+                        'gruppo. Gli altri membri passeranno alle nuove '
+                        'chiavi e chi è uscito non potrà più leggere.'
+                    : 'Incolla questo codice di aggiornamento nel gruppo: '
+                        'gli altri membri passeranno alle nuove chiavi e chi '
+                        'è uscito non potrà più leggere.'),
+                const SizedBox(height: 12),
+                Container(
+                  constraints: const BoxConstraints(maxHeight: 120),
+                  child: SingleChildScrollView(
+                    child: SelectableText(blob,
+                        style: const TextStyle(
+                            fontFamily: 'monospace', fontSize: 10)),
+                  ),
+                ),
+              ],
+            ),
             actions: [
+              TextButton.icon(
+                onPressed: () =>
+                    copyToClipboard(ctx2, blob, 'Codice copiato'),
+                icon: const Icon(Icons.copy, size: 18),
+                label: const Text('Copia'),
+              ),
               FilledButton(
                 onPressed: () => Navigator.pop(ctx2),
                 child: const Text('Fatto'),

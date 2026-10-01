@@ -1,9 +1,12 @@
 {
     "name": "AlienMsg",
     "short_name": "AlienMsg",
+    "id": ".",
     "start_url": ".",
     "scope": ".",
     "display": "standalone",
+    "lang": "it",
+    "dir": "ltr",
     "background_color": "#1A1030",
     "theme_color": "#1A1030",
     "description": "Messaggi cifrati end-to-end, offline, copy-paste.",

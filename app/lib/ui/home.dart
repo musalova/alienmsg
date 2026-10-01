@@ -35,11 +35,50 @@ class _HomeScreenState extends State<HomeScreen> {
             ],
           ),
         ),
-        body: [
-          const ContactsTab(),
-          const GroupsTab(),
-          const SettingsTab(),
-        ][_tab],
+        body: Column(
+          children: [
+            if (store.persistFailed)
+              MaterialBanner(
+                backgroundColor: Theme.of(context).colorScheme.errorContainer,
+                content: const Text(
+                    'Spazio esaurito — i nuovi messaggi potrebbero non essere '
+                    'salvati. Elimina qualche chat o libera spazio.'),
+                actions: [
+                  TextButton(
+                    onPressed: store.acknowledgePersistFailure,
+                    child: const Text('OK'),
+                  ),
+                ],
+              ),
+            if (store.recoveryPhrase != null && !store.backupDismissed)
+              MaterialBanner(
+                leading: const Icon(Icons.key_outlined),
+                content: const Text(
+                    'Se perdi questo dispositivo perdi il profilo. Salva la '
+                    'frase di recupero?'),
+                actions: [
+                  TextButton(
+                    onPressed: store.dismissBackupReminder,
+                    child: const Text('Dopo'),
+                  ),
+                  FilledButton(
+                    onPressed: () {
+                      store.dismissBackupReminder();
+                      showRecoveryDialog(context);
+                    },
+                    child: const Text('Salva ora'),
+                  ),
+                ],
+              ),
+            Expanded(
+              child: [
+                const ContactsTab(),
+                const GroupsTab(),
+                const SettingsTab(),
+              ][_tab],
+            ),
+          ],
+        ),
         bottomNavigationBar: NavigationBar(
           selectedIndex: _tab,
           onDestinationSelected: (i) => setState(() => _tab = i),
@@ -220,13 +259,41 @@ class ContactsTab extends StatelessWidget {
     final cs = store.contacts;
     return Scaffold(
       body: cs.isEmpty
-          ? const Center(
+          ? Center(
               child: Padding(
-                padding: EdgeInsets.all(24),
-                child: Text(
-                    'Nessun amico ancora.\nTocca 👤+ e incolla il suo codice,\n'
-                    'oppure mostra il tuo con il pulsante QR.',
-                    textAlign: TextAlign.center),
+                padding: const EdgeInsets.all(32),
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 340),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Text('Per iniziare:', textAlign: TextAlign.center,
+                          style: TextStyle(fontWeight: FontWeight.bold)),
+                      const SizedBox(height: 16),
+                      SizedBox(
+                        width: double.infinity,
+                        child: FilledButton.tonalIcon(
+                          onPressed: () => _showMyCard(context),
+                          icon: const Icon(Icons.qr_code),
+                          label: const Text('1. Mostra il tuo codice'),
+                        ),
+                      ),
+                      const Padding(
+                        padding: EdgeInsets.symmetric(vertical: 8),
+                        child: Text('oppure, se l\'amico ti ha già scritto',
+                            textAlign: TextAlign.center),
+                      ),
+                      SizedBox(
+                        width: double.infinity,
+                        child: FilledButton.tonalIcon(
+                          onPressed: () => _addContact(context),
+                          icon: const Icon(Icons.person_add),
+                          label: const Text('2. Incolla il suo codice'),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
               ),
             )
           : ListView.builder(
@@ -340,15 +407,41 @@ class GroupsTab extends StatelessWidget {
           .showSnackBar(SnackBar(content: Text(invite.substring(4))));
       return;
     }
-    Clipboard.setData(ClipboardData(text: invite));
+    bool copied = true;
+    try {
+      Clipboard.setData(ClipboardData(text: invite));
+    } catch (_) {
+      copied = false; // Safari/web can deny clipboard: show it instead
+    }
     await showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('Gruppo creato'),
-        content: const Text(
-            'Ho copiato l\'invito: incollalo nella chat con i tuoi amici. '
-            'Chi lo riceve entra automaticamente.'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(copied
+                ? 'Ho copiato l\'invito: incollalo nella chat con i tuoi '
+                    'amici. Chi lo riceve entra automaticamente.'
+                : 'Incolla questo invito nella chat con i tuoi amici. Chi lo '
+                    'riceve entra automaticamente.'),
+            const SizedBox(height: 12),
+            Container(
+              constraints: const BoxConstraints(maxHeight: 120),
+              child: SingleChildScrollView(
+                child: SelectableText(invite,
+                    style: const TextStyle(
+                        fontFamily: 'monospace', fontSize: 10)),
+              ),
+            ),
+          ],
+        ),
         actions: [
+          TextButton.icon(
+            onPressed: () => copyToClipboard(ctx, invite, 'Invito copiato'),
+            icon: const Icon(Icons.copy, size: 18),
+            label: const Text('Copia'),
+          ),
           FilledButton(
             onPressed: () => Navigator.pop(ctx),
             child: const Text('Fatto'),
@@ -555,50 +648,6 @@ class SettingsTab extends StatelessWidget {
     }
   }
 
-  Future<void> _recoveryDialog(BuildContext context) async {
-    final phrase = store.recoveryPhrase;
-    await showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Frase di recupero'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text(
-                'Serve solo se vuoi spostare il profilo su un altro '
-                'dispositivo o ripristinarlo dopo un problema. Non serve per '
-                'l\'uso quotidiano.'),
-            const SizedBox(height: 12),
-            if (phrase != null)
-              Container(
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  border: Border.all(color: Colors.white24),
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: SelectableText(phrase,
-                    style: const TextStyle(
-                        fontFamily: 'monospace', fontSize: 14, height: 1.5)),
-              )
-            else
-              const Text('Nessuna frase salvata per questo profilo.'),
-          ],
-        ),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(ctx), child: const Text('Chiudi')),
-          if (phrase != null)
-            FilledButton.icon(
-              onPressed: () => copyToClipboard(context, phrase, 'Frase copiata'),
-              icon: const Icon(Icons.copy),
-              label: const Text('Copia'),
-            ),
-        ],
-      ),
-    );
-  }
-
   @override
   Widget build(BuildContext context) {
     return ListView(
@@ -630,11 +679,16 @@ class SettingsTab extends StatelessWidget {
               '(icona 🔑 in alto nella chat): se è uguale, nessuno vi spia.'),
         ),
         const Divider(height: 32),
-        const ListTile(
-          leading: Icon(Icons.devices),
-          title: Text('Profilo legato a questo dispositivo'),
-          subtitle: Text('Il vault è cifrato con Windows: una copia del file '
-              'non si apre altrove.'),
+        ListTile(
+          leading: const Icon(Icons.devices),
+          title: const Text('Profilo legato a questo dispositivo'),
+          subtitle: Text(switch (store.lockMode) {
+            'pin' =>
+              'Il vault è cifrato e protetto dal tuo PIN: senza di esso non si apre.',
+            _ => kIsWeb
+                ? 'Il vault è cifrato e legato a questo browser.'
+                : 'Il vault è cifrato e legato a questo dispositivo: una copia del file non si apre altrove.',
+          }),
         ),
         ListTile(
           leading: Icon(switch (store.lockMode) {
@@ -655,7 +709,7 @@ class SettingsTab extends StatelessWidget {
           title: const Text('Frase di recupero'),
           subtitle: const Text(
               'Backup opzionale per spostare il profilo su un altro dispositivo'),
-          onTap: () => _recoveryDialog(context),
+          onTap: () => showRecoveryDialog(context),
         ),
         const SizedBox(height: 24),
         Padding(
@@ -691,4 +745,50 @@ class SettingsTab extends StatelessWidget {
       ],
     );
   }
+}
+
+/// Recovery-phrase dialog — shared by the settings tile and the one-time
+/// backup reminder banner on the home screen.
+void showRecoveryDialog(BuildContext context) {
+  final phrase = store.recoveryPhrase;
+  showDialog(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: const Text('Frase di recupero'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+              'Scrivila su un foglio e conservala in un posto sicuro: è '
+              'l\'unico modo per recuperare il profilo se perdi questo '
+              'dispositivo. Non serve per l\'uso quotidiano.'),
+          const SizedBox(height: 12),
+          if (phrase != null)
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                border: Border.all(color: Colors.white24),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: SelectableText(phrase,
+                  style: const TextStyle(
+                      fontFamily: 'monospace', fontSize: 14, height: 1.5)),
+            )
+          else
+            const Text('Nessuna frase salvata per questo profilo.'),
+        ],
+      ),
+      actions: [
+        TextButton(
+            onPressed: () => Navigator.pop(ctx), child: const Text('Chiudi')),
+        if (phrase != null)
+          FilledButton.icon(
+            onPressed: () => copyToClipboard(context, phrase, 'Frase copiata'),
+            icon: const Icon(Icons.copy),
+            label: const Text('Copia'),
+          ),
+      ],
+    ),
+  );
 }

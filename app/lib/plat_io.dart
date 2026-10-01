@@ -12,6 +12,12 @@ import 'api.dart';
 
 const _secure = FlutterSecureStorage();
 
+/// Nothing to prepare on native (DPAPI/Keystore are always ready).
+Future<void> secureReady() async {}
+
+/// Single-process native apps have no multi-tab vault writes — no-op.
+void onVaultChanged(void Function() cb) {}
+
 Future<String> defaultVaultPath() async {
   final dir = await getApplicationSupportDirectory();
   return '${dir.path}${Platform.pathSeparator}alienmsg.vault';

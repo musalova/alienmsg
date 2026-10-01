@@ -19,6 +19,9 @@
   <meta charset="UTF-8">
   <meta content="IE=Edge" http-equiv="X-UA-Compatible">
   <meta name="description" content="AlienMsg — messaggi cifrati end-to-end, offline, copy-paste.">
+  <!-- viewport-fit=cover: required on iOS so env(safe-area-inset-*) and the
+       standalone display mode work around the notch/home indicator. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 
   <!-- iOS meta tags & icons -->
   <meta name="mobile-web-app-capable" content="yes">
@@ -33,19 +36,47 @@
 
   <title>AlienMsg</title>
   <link rel="manifest" href="manifest.json">
+
+  <!-- Device-bound secret store (IndexedDB non-extractable key) used by
+       plat_web.dart; must load before the app touches secure storage. -->
+  <script src="secure.js"></script>
 </head>
 <body>
   <!--
     Load the Rust crypto core (WASM) before Flutter boots: the module
     instantiates pkg/alien_ffi_bg.wasm and exposes window.alienInvoke(json)
     used by ffi_transport_web.dart. window.alienReady resolves when usable.
+    A failure shows a readable error instead of a permanently blank page.
   -->
   <script type="module">
     import init, { alienInvokeJson } from './pkg/alien_ffi.js';
     window.alienReady = init().then(() => {
       window.alienInvoke = (req) => alienInvokeJson(req);
+    }).catch((e) => {
+      const d = document.createElement('div');
+      d.style.cssText = 'color:#fff;background:#1A1030;font-family:sans-serif;' +
+          'position:fixed;inset:0;display:flex;align-items:center;' +
+          'justify-content:center;text-align:center;padding:32px;z-index:9999';
+      d.textContent = 'AlienMsg: motore crittografico non caricato. ' +
+          'Ricarica la pagina; se il problema persiste il browser potrebbe ' +
+          'non supportare WebAssembly.';
+      document.body.appendChild(d);
+      throw e;
     });
   </script>
+
+  <!-- flutter_bootstrap.js registers flutter_service_worker.js itself.
+       Post-build we overwrite the generated self-unregistering stub with
+       our real worker (web/sw.js) — see scripts/build_web.sh. -->
   <script src="flutter_bootstrap.js" async></script>
+
+  <noscript>
+    <div style="color:#fff;background:#1A1030;font-family:sans-serif;
+        position:fixed;inset:0;display:flex;align-items:center;
+        justify-content:center;text-align:center;padding:32px">
+      AlienMsg richiede JavaScript: la crittografia avviene sul tuo
+      dispositivo (WASM), nessun server legge i messaggi.
+    </div>
+  </noscript>
 </body>
 </html>

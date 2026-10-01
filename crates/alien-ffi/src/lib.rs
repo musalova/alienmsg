@@ -230,6 +230,18 @@ fn run(v: &Value) -> Result<Value, String> {
             let raw = get_b64(v, "data")?;
             Ok(json!({"bytes": b64(&dpapi_unwrap(&raw)?)}))
         }
+        "pin_wrap" => {
+            let pin = get_str(v, "pin")?;
+            let raw = get_b64(v, "data")?;
+            let blob = alien_store::pin_wrap(pin, &raw).map_err(|e| e.to_string())?;
+            Ok(json!({"wrapped": b64(&blob)}))
+        }
+        "pin_unwrap" => {
+            let pin = get_str(v, "pin")?;
+            let raw = get_b64(v, "data")?;
+            let pt = alien_store::pin_unwrap(pin, &raw).map_err(|e| e.to_string())?;
+            Ok(json!({"bytes": b64(&pt)}))
+        }
         "identity_create" => {
             // Two ways to create an identity:
             //  - mnemonic + optional passphrase (recovery-friendly)

@@ -102,8 +102,30 @@ class Store extends ChangeNotifier {
   List<Contact> contacts = [];
   List<GroupChat> groups = [];
 
+  /// The password that opened the vault (device-bound random key or the
+  /// user's legacy password). Kept so [setPin] can re-wrap the device key
+  /// without asking again.
+  String? _devPass;
+
   /// App lock gate: null = open, 'pin' = PIN code, 'hello' = Windows Hello.
+  /// 'pin' additionally wraps the device key cryptographically (see
+  /// [unlockWithPin]) so the vault is unreadable without it.
   String? lockMode;
+
+  /// True when the device key is PIN-wrapped: the vault cannot be opened
+  /// until the user enters the PIN. [isLocked] stays false — this is a
+  /// distinct pre-open state.
+  bool needsPinToOpen = false;
+
+  /// Set when a persist call failed (e.g. storage quota exhausted on web).
+  /// Surfaced as a warning banner; retried on the next mutation.
+  bool persistFailed = false;
+
+  /// Dismiss the "storage full" banner (the next real write retries anyway).
+  void acknowledgePersistFailure() {
+    persistFailed = false;
+    notifyListeners();
+  }
 
   bool get isOpen => _vault != null;
 
@@ -125,6 +147,10 @@ class Store extends ChangeNotifier {
   String? get vaultPath => _vaultPath;
   bool get hasIdentity => identitySeed != null;
 
+  /// Record the vault path before it is opened — needed when a PIN-wrapped
+  /// device key must be unwrapped (and the PIN verified) *before* [open].
+  void prepareVaultPath(String path) => _vaultPath = path;
+
   static Future<String> defaultVaultPath() => plat.defaultVaultPath();
 
   /// Sidecar names next to the vault: the wrapped vault password
@@ -144,9 +170,23 @@ class Store extends ChangeNotifier {
     return plat.secureRead(vaultPath, 'devkey.tmp');
   }
 
+  /// Marker prefix on the device key when it is PIN-wrapped: the stored
+  /// value is `pin:<base64 ALNP blob>` and cannot be used until
+  /// [unlockWithPin] unwraps it with the user's PIN.
+  static const pinPrefix = 'pin:';
+
+  /// True when the stored device key for [vaultPath] is PIN-wrapped.
+  static Future<bool> devkeyNeedsPin(String vaultPath) async {
+    final v = await devicePassword(vaultPath);
+    return v != null && v.startsWith(pinPrefix);
+  }
+
   /// Which lock gate is configured for [vaultPath]: 'pin' | 'hello' | null.
   static Future<String?> detectLockMode(String vaultPath) async {
+    if (await devkeyNeedsPin(vaultPath)) return 'pin';
     if (await plat.secureRead(vaultPath, 'hello') != null) return 'hello';
+    // Legacy marker from before PIN became a cryptographic wrap — the gate
+    // still applies and gets migrated on the next successful unlock.
     if (await plat.secureRead(vaultPath, 'pin') != null) return 'pin';
     return null;
   }
@@ -183,6 +223,7 @@ class Store extends ChangeNotifier {
       vaultProtected = r['protected'] == true;
     }
     _locked = false;
+    _devPass = password;
     _load();
   }
 
@@ -214,6 +255,20 @@ class Store extends ChangeNotifier {
     return vaultProtected;
   }
 
+  /// PIN-first unlock: the device key was PIN-wrapped at [setPin] time, so
+  /// the vault cannot open until this unwraps it. Wrong PIN = AEAD failure —
+  /// verification is cryptographic, nothing plaintext is compared.
+  Future<void> unlockWithPin(String pin) async {
+    final path = _vaultPath;
+    final wrapped = await devicePassword(path ?? '');
+    if (path == null || wrapped == null || !wrapped.startsWith(pinPrefix)) {
+      throw const VaultLockedException();
+    }
+    final devPass = AlienApi.pinUnwrap(pin, wrapped.substring(pinPrefix.length));
+    await open(path, utf8.decode(base64Decode(devPass)));
+    needsPinToOpen = false;
+  }
+
   static T? _decodeVaultJson<T>(String? b64, T Function(dynamic json) f) {
     if (b64 == null) return null;
     try {
@@ -242,30 +297,49 @@ class Store extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Prekey bundles accumulate one per generated card; cap so the vault
+  /// can't grow without bound (oldest unclaimed cards become unusable).
+  static const _bundleCap = 300;
+
   void _persist() {
     final v = _vault;
     if (v == null) return; // wiped/closed vault: nothing to persist to
-    if (identitySeed != null) AlienApi.vaultSet(v, 'identity', identitySeed!);
-    if (recoveryPhrase != null) {
+    try {
+      if (identitySeed != null) AlienApi.vaultSet(v, 'identity', identitySeed!);
+      if (recoveryPhrase != null) {
+        AlienApi.vaultSet(v, 'recovery',
+            base64Encode(utf8.encode(jsonEncode(recoveryPhrase))));
+      }
+      AlienApi.vaultSet(v, 'meta',
+          base64Encode(utf8.encode(jsonEncode({'pub_id': pubId}))));
+      if (bundles.length > _bundleCap) {
+        bundles.removeRange(0, bundles.length - _bundleCap);
+      }
       AlienApi.vaultSet(
-          v, 'recovery', base64Encode(utf8.encode(jsonEncode(recoveryPhrase))));
+          v, 'bundles', base64Encode(utf8.encode(jsonEncode(bundles))));
+      AlienApi.vaultSet(
+          v,
+          'contacts',
+          base64Encode(
+              utf8.encode(jsonEncode(contacts.map((c) => c.toJson()).toList()))));
+      AlienApi.vaultSet(
+          v,
+          'groups',
+          base64Encode(
+              utf8.encode(jsonEncode(groups.map((g) => g.toJson()).toList()))));
+      if (_vaultPath != null) AlienApi.vaultSave(v, _vaultPath!);
+      if (persistFailed) {
+        persistFailed = false;
+        notifyListeners();
+      }
+    } catch (_) {
+      // Storage quota exhausted (localStorage ~5MB) or a closed handle —
+      // don't crash the caller, flag it so the UI can warn instead.
+      if (!persistFailed) {
+        persistFailed = true;
+        notifyListeners();
+      }
     }
-    AlienApi.vaultSet(
-        v,
-        'meta',
-        base64Encode(utf8.encode(jsonEncode({'pub_id': pubId}))));
-    AlienApi.vaultSet(v, 'bundles', base64Encode(utf8.encode(jsonEncode(bundles))));
-    AlienApi.vaultSet(
-        v,
-        'contacts',
-        base64Encode(
-            utf8.encode(jsonEncode(contacts.map((c) => c.toJson()).toList()))));
-    AlienApi.vaultSet(
-        v,
-        'groups',
-        base64Encode(
-            utf8.encode(jsonEncode(groups.map((g) => g.toJson()).toList()))));
-    if (_vaultPath != null) AlienApi.vaultSave(v, _vaultPath!);
   }
 
   void createIdentity(String mnemonic, String passphrase) {
@@ -310,15 +384,34 @@ class Store extends ChangeNotifier {
   }
 
   /// Enable/disable the PIN gate. Null disables.
+  ///
+  /// When set, the device key is rewritten PIN-wrapped (`pin:<blob>`): from
+  /// then on the vault cryptographically requires the PIN — a file/storage
+  /// copy alone is not enough, unlike a UI-only gate. Setting a PIN disables
+  /// the Hello gate (a single gate keeps the model simple); the hello marker
+  /// is removed.
   Future<void> setPin(String? pin) async {
     final path = _vaultPath;
     if (path == null) return;
     if (pin == null || pin.isEmpty) {
-      await plat.secureDelete(path, 'pin');
+      // Restore a plaintext device key so boot works without a PIN. If the
+      // vault was never device-bound yet, leave it unbound.
+      if (_devPass != null) await plat.secureWrite(path, 'devkey', _devPass!);
+      await plat.secureDelete(path, 'pin'); // legacy marker
       lockMode =
           await plat.secureRead(path, 'hello') != null ? 'hello' : null;
     } else {
-      await plat.secureWrite(path, 'pin', 'pin.$pin');
+      var pw = _devPass;
+      if (pw == null || pw.isEmpty) {
+        pw = 'dev.${AlienApi.randomBytes(32)}';
+        setVaultPassword(pw);
+        _devPass = pw;
+      }
+      final wrapped = AlienApi.pinWrap(
+          pin, base64Encode(utf8.encode(pw)));
+      await plat.secureWrite(path, 'devkey', '$pinPrefix$wrapped');
+      await plat.secureDelete(path, 'pin'); // legacy marker
+      await plat.secureDelete(path, 'hello'); // PIN replaces the hello gate
       lockMode = 'pin';
     }
     notifyListeners();
@@ -338,12 +431,26 @@ class Store extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Verify a PIN attempt against the stored PIN.
+  /// Verify a PIN attempt. Legacy path (post-open gate): the marker stored
+  /// `pin.<pin>` — checked, then transparently migrated to a PIN-wrapped
+  /// device key so the vault itself becomes PIN-bound.
   Future<bool> checkPin(String pin) async {
     final path = _vaultPath;
     if (path == null) return false;
     try {
-      return await plat.secureRead(path, 'pin') == 'pin.$pin';
+      if (await plat.secureRead(path, 'pin') == 'pin.$pin') {
+        // Migrate: wrap the current device key under the PIN and drop the
+        // plaintext-verifier marker.
+        final pw = _devPass ?? await devicePassword(path);
+        if (pw != null && pw.isNotEmpty && !pw.startsWith(pinPrefix)) {
+          final wrapped =
+              AlienApi.pinWrap(pin, base64Encode(utf8.encode(pw)));
+          await plat.secureWrite(path, 'devkey', '$pinPrefix$wrapped');
+          await plat.secureDelete(path, 'pin');
+        }
+        return true;
+      }
+      return false;
     } catch (_) {
       return false;
     }
@@ -581,9 +688,55 @@ class Store extends ChangeNotifier {
     final list = history(key)..add(entry);
     final trimmed =
         list.length > 200 ? list.sublist(list.length - 200) : list;
-    AlienApi.vaultSet(
-        v, key, base64Encode(utf8.encode(jsonEncode(trimmed))));
-    if (_vaultPath != null) AlienApi.vaultSave(v, _vaultPath!);
+    try {
+      AlienApi.vaultSet(
+          v, key, base64Encode(utf8.encode(jsonEncode(trimmed))));
+      if (_vaultPath != null) AlienApi.vaultSave(v, _vaultPath!);
+      if (persistFailed) {
+        persistFailed = false;
+        notifyListeners();
+      }
+    } catch (_) {
+      if (!persistFailed) {
+        persistFailed = true;
+        notifyListeners();
+      }
+    }
+  }
+
+  /// Reload vault state after another browser tab changed it (web only —
+  /// wired via [plat.onVaultChanged]). The wasm vault handle is in-memory,
+  /// so we close and reopen from storage with the password we already hold.
+  Future<void> reloadFromStorage() async {
+    final path = _vaultPath;
+    final pw = _devPass;
+    final v = _vault;
+    if (path == null || pw == null) return;
+    try {
+      if (v != null) AlienApi.vaultClose(v);
+      final r = AlienApi.vaultOpen(path, pw);
+      _vault = r['handle'] as int;
+      vaultProtected = r['protected'] == true;
+      _load();
+      notifyListeners();
+    } catch (_) {}
+  }
+
+  /// Whether the one-time "salva la frase di recupero" banner was dismissed.
+  bool get backupDismissed {
+    final v = _vault;
+    if (v == null) return true;
+    return AlienApi.vaultGet(v, 'backup_dismissed') != null;
+  }
+
+  void dismissBackupReminder() {
+    final v = _vault;
+    if (v == null) return;
+    try {
+      AlienApi.vaultSet(v, 'backup_dismissed', 'MQ=='); // '1'
+      if (_vaultPath != null) AlienApi.vaultSave(v, _vaultPath!);
+    } catch (_) {}
+    notifyListeners();
   }
 
   /// Remove a contact together with its session state (the session blob is
@@ -612,8 +765,11 @@ class Store extends ChangeNotifier {
   Future<void> wipe() async {
     if (_vault != null) AlienApi.vaultClose(_vault!);
     _vault = null;
+    _devPass = null;
     _locked = false;
     _gated = false;
+    needsPinToOpen = false;
+    persistFailed = false;
     vaultProtected = false;
     identitySeed = null;
     pubId = null;

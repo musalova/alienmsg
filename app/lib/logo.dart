@@ -15,11 +15,15 @@ class AlienLogo extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return SizedBox(
-      width: size,
-      height: size,
-      child: CustomPaint(
-          painter: AlienLogoPainter(showBackground: showBackground)),
+    // UnconstrainedBox: inside ListView/Row the cross axis is forced to the
+    // full extent, which would stretch the tile and let the paint overflow.
+    return UnconstrainedBox(
+      child: SizedBox(
+        width: size,
+        height: size,
+        child: CustomPaint(
+            painter: AlienLogoPainter(showBackground: showBackground)),
+      ),
     );
   }
 }

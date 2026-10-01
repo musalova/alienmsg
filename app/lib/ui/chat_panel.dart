@@ -116,13 +116,55 @@ class _ChatPanelState extends State<ChatPanel> {
       _snack('Errore: $e');
       return;
     }
-    Clipboard.setData(ClipboardData(text: code));
+    bool copied = true;
+    try {
+      Clipboard.setData(ClipboardData(text: code));
+    } catch (_) {
+      copied = false; // web clipboard can be denied: never lose the code
+    }
     _lastCopied = code;
     setState(() => _codeInClipboard = false);
     _append(ChatEntry(pt, mine: true));
     _ctrl.clear();
     _scrollDown();
-    _snack('Copiato! Ora incollalo nella chat col tuo amico.');
+    if (copied) {
+      _snack('Copiato! Ora incollalo nella chat col tuo amico.');
+    } else {
+      _showCodeDialog(code);
+    }
+  }
+
+  /// Fallback when programmatic clipboard copy fails (Safari permission):
+  /// show the encrypted code so the user can select-copy it manually.
+  void _showCodeDialog(String code) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Il tuo messaggio cifrato'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text(
+                'Seleziona e copia questo codice, poi incollalo dove vuoi.'),
+            const SizedBox(height: 12),
+            Container(
+              constraints: const BoxConstraints(maxHeight: 160),
+              child: SingleChildScrollView(
+                child: SelectableText(code,
+                    style: const TextStyle(
+                        fontFamily: 'monospace', fontSize: 10)),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Fatto'),
+          ),
+        ],
+      ),
+    );
   }
 
   String _friendlyError(Object e) {

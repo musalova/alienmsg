@@ -19,9 +19,12 @@ import 'package:url_launcher/url_launcher.dart';
 class UpdateChecker {
   UpdateChecker._();
 
-  /// Edit to point at your update manifest. Empty disables the feature.
+  /// Points at the manifest deployed alongside the PWA on GitHub Pages —
+  /// free hosting we already control, zero extra infrastructure. Bump
+  /// `version` there (and in pubspec) to announce a native release.
+  /// Empty disables the feature.
   static const manifestUrl =
-      'https://alienmsg.example.com/updates/latest.json';
+      'https://musalova.github.io/alienmsg/latest.json';
 
   static Future<UpdateInfo?> check() async {
     // The PWA is always current: the service worker serves the newest build

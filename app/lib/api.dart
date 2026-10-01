@@ -35,6 +35,17 @@ class AlienApi {
       AlienFfi.call({'op': 'dpapi_unwrap', 'data': wrappedB64})['bytes']
           as String;
 
+  /// Wrap [dataB64] under a user PIN (Argon2id + XChaCha20-Poly1305).
+  /// Returns a self-contained b64 `ALNP` blob. Works on every platform —
+  /// this is what makes the PIN a cryptographic requirement, not a UI gate.
+  static String pinWrap(String pin, String dataB64) => AlienFfi.call(
+      {'op': 'pin_wrap', 'pin': pin, 'data': dataB64})['wrapped'] as String;
+
+  /// Unwrap a `pin_wrap` blob. Throws on wrong PIN (AEAD failure).
+  static String pinUnwrap(String pin, String wrappedB64) => AlienFfi.call(
+      {'op': 'pin_unwrap', 'pin': pin, 'data': wrappedB64})['bytes']
+      as String;
+
   /// Returns {card_envelope, card, bundle, card_id, owner_id}.
   static Map<String, dynamic> cardCreate(String identityB64) =>
       AlienFfi.call({'op': 'card_create', 'identity': identityB64});

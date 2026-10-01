@@ -74,3 +74,25 @@ fn corrupt_file_is_not_protected() {
     assert!(Vault::open(&p, "").is_err());
     let _ = std::fs::remove_file(&p);
 }
+
+#[test]
+fn pin_wrap_roundtrip() {
+    let blob = alien_store::pin_wrap("1234", b"the device key").unwrap();
+    // self-contained envelope: magic + salt + nonce + ct
+    assert_eq!(&blob[..4], b"ALNP");
+    // correct PIN unwraps, wrong PIN fails AEAD
+    assert_eq!(
+        alien_store::pin_unwrap("1234", &blob).unwrap(),
+        b"the device key"
+    );
+    assert!(alien_store::pin_unwrap("0000", &blob).is_err());
+    // corrupt blob fails, not panics
+    assert!(alien_store::pin_unwrap("1234", b"garbage").is_err());
+    // different PINs produce independent wraps
+    let b2 = alien_store::pin_wrap("9999", b"the device key").unwrap();
+    assert!(alien_store::pin_unwrap("1234", &b2).is_err());
+    assert_eq!(
+        alien_store::pin_unwrap("9999", &b2).unwrap(),
+        b"the device key"
+    );
+}
