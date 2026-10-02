@@ -457,6 +457,7 @@ fn run(v: &Value) -> Result<Value, String> {
             let fmt = match get_str(v, "format")? {
                 "emoji" => alien_codec::Format::Emoji,
                 "words" => alien_codec::Format::Words,
+                "frasi" => alien_codec::Format::Frasi,
                 _ => alien_codec::Format::Blob,
             };
             Ok(json!({"text": alien_codec::encode(&raw, fmt)}))

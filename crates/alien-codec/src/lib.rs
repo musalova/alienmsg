@@ -3,6 +3,7 @@
 //! - `Blob`  : "AYA1:" + base64url — compact, obviously encoded data.
 //! - `Emoji` : 👽 + one emoji per byte — doesn't look like encryption.
 //! - `Words` : pseudo-word syllables — resembles nonsense natural language.
+//! - `Frasi` : grammatical Italian cover sentences, unrelated to the message.
 //!
 //! Stealth formats add *opacity*, not security: the AEAD ciphertext underneath
 //! is already indistinguishable from random noise.
@@ -10,11 +11,14 @@
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 
+mod sentences;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
     Blob,
     Emoji,
     Words,
+    Frasi,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -95,6 +99,7 @@ pub fn encode(data: &[u8], format: Format) -> String {
             }
             s
         }
+        Format::Frasi => sentences::encode(data),
     }
 }
 
@@ -110,6 +115,13 @@ pub fn decode(input: &str) -> Result<Vec<u8>, CodecError> {
     // sender names, etc.) — decode_emoji skips everything up to it.
     if trimmed.contains(EMOJI_MARKER) {
         return decode_emoji(trimmed);
+    }
+    // Frasi first: its decoder is strict (every word must resolve to a
+    // dictionary slot or a carrier), while a pseudo-words payload almost
+    // never does. A words payload conversely starts with a consonant+
+    // vowel pair that fails the frasi dictionary lookup.
+    if let Ok(bytes) = sentences::decode(trimmed) {
+        return Ok(bytes);
     }
     decode_words(trimmed)
 }
@@ -200,6 +212,32 @@ mod tests {
     fn words_roundtrip() {
         let d = sample();
         assert_eq!(decode(&encode(&d, Format::Words)).unwrap(), d);
+    }
+
+    #[test]
+    fn frasi_roundtrip() {
+        let d = sample();
+        let enc = encode(&d, Format::Frasi);
+        assert_eq!(decode(&enc).unwrap(), d);
+    }
+
+    #[test]
+    fn frasi_output_is_italian_prose() {
+        let enc = encode(b"hello world", Format::Frasi);
+        // no blob prefix, no emoji marker; looks like sentences
+        assert!(!enc.contains(BLOB_PREFIX));
+        assert!(!enc.contains(EMOJI_MARKER));
+        assert!(enc.ends_with('.'));
+        assert!(enc.chars().all(|c| c.is_alphabetic() || c.is_whitespace() || ".'’".contains(c)));
+    }
+
+    #[test]
+    fn frasi_mutation_is_rejected() {
+        let d = vec![0x12, 0xAB, 0x00, 0xFF, 0x77];
+        let enc = encode(&d, Format::Frasi);
+        // a token not in the dictionary fails the whole decode
+        let broken = format!("{enc} xylophone.");
+        assert!(decode(&broken).is_err());
     }
 
     #[test]

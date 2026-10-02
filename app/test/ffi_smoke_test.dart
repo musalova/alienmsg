@@ -48,6 +48,12 @@ void main() {
         AlienApi.render(e['envelope'] as String, 'emoji');
     expect(emojiText.startsWith('👽'), isTrue);
 
+    // Frasi cover text roundtrips through the same envelope
+    final frasi = AlienApi.render(e['envelope'] as String, 'frasi');
+    expect(frasi.contains('AYA1:'), isFalse);
+    expect(frasi.contains('👽'), isFalse);
+    expect(AlienApi.unrender(frasi), e['envelope']);
+
     // Bob decodes and accepts the session
     final envB64 = AlienApi.unrender(emojiText);
     final d = AlienApi.decrypt(

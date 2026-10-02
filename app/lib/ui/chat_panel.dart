@@ -58,7 +58,7 @@ class _ChatPanelState extends State<ChatPanel> {
   final _ctrl = TextEditingController();
   final _scroll = ScrollController();
   final _msgs = <ChatEntry>[];
-  String _format = 'blob';
+  String _format = 'frasi';
   bool _codeInClipboard = false;
 
   /// Shared across instances: a code we just produced must not trigger the
@@ -66,7 +66,8 @@ class _ChatPanelState extends State<ChatPanel> {
   static String _lastCopied = '';
 
   static const _formats = {
-    'blob': 'Codice (consigliato)',
+    'frasi': 'Frasi italiane (consigliato)',
+    'blob': 'Codice compatto',
     'emoji': 'Emoji',
     'words': 'Parole inventate',
   };

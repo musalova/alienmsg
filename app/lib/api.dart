@@ -134,7 +134,7 @@ class AlienApi {
         'plaintext': plaintext
       });
 
-  /// format: 'blob' | 'emoji' | 'words'
+  /// format: 'blob' | 'emoji' | 'words' | 'frasi'
   static String render(String bytesB64, String format) =>
       AlienFfi.call({'op': 'render', 'bytes': bytesB64, 'format': format})[
           'text'] as String;
