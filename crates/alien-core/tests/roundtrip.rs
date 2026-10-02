@@ -205,14 +205,14 @@ fn group_full_lifecycle() {
     let group_id = admin.groups[0].group_id;
 
     match m1.recv(&invite_env) {
-        Inbound::GroupJoined(g) => {
+        Inbound::GroupJoined { group: g, .. } => {
             assert_eq!(g.group_id, group_id);
             m1.groups.push(g);
         }
         _ => panic!("m1 expected GroupJoined"),
     }
     match m2.recv(&invite_env) {
-        Inbound::GroupJoined(g) => m2.groups.push(g),
+        Inbound::GroupJoined { group: g, .. } => m2.groups.push(g),
         _ => panic!("m2 expected GroupJoined"),
     }
 
@@ -349,7 +349,7 @@ fn setup_group() -> (Party, Party, Party) {
     admin.groups.push(g);
     for member in [&mut m1, &mut m2] {
         match member.recv(&invite) {
-            Inbound::GroupJoined(g) => member.groups.push(g),
+            Inbound::GroupJoined { group: g, .. } => member.groups.push(g),
             _ => panic!(),
         }
     }
@@ -543,6 +543,153 @@ fn pairinit_replay_after_bundle_pruned_fails() {
     b.bundles.clear();
     assert!(b.try_recv(&env).is_err());
     assert_eq!(b.sessions.len(), 1);
+}
+
+#[test]
+fn group_invite_on_fresh_pairinit_session() {
+    // Admin pairs with a member but NEVER sends a pairwise message, then
+    // immediately invites them to a group. encrypt_pair emits a PairInit as
+    // the inner wrap — the member must accept the handshake AND read the
+    // invite in one shot. Regression test: previously the inner PairInit
+    // was rejected outright ("invite needs an established pairwise session").
+    let mut admin = Party::new(&[50u8; 32]);
+    let mut m = Party::new(&[51u8; 32]);
+
+    let ca = admin.new_card();
+    let cm = m.new_card();
+    let s = handshake::initiate(&admin.identity, &ca, &cm).unwrap();
+    admin.sessions.push(s); // session created, zero messages exchanged
+
+    let m_id = m.identity.public_id();
+    let (g, invite) =
+        message::group_create(&admin.identity, &mut admin.sessions, &[m_id], "fresh").unwrap();
+    admin.groups.push(g);
+
+    match m.recv(&invite) {
+        Inbound::GroupJoined {
+            group,
+            inner_session,
+        } => {
+            assert_eq!(group.group_id, admin.groups[0].group_id);
+            m.groups.push(group);
+            let is = inner_session.expect("invite must report the new session");
+            // decrypt_any already pushed the session into m.sessions — just
+            // sanity-check the reported index points at it.
+            assert_eq!(is.session_index, 0);
+            assert_eq!(
+                m.sessions[is.session_index].peer_id,
+                admin.identity.public_id()
+            );
+        }
+        other => panic!("m expected GroupJoined, got {:?}", kind_name(&other)),
+    }
+    assert_eq!(m.sessions.len(), 1);
+    assert_eq!(m.sessions[0].peer_id, admin.identity.public_id());
+
+    // Both directions must now work pairwise as well.
+    let e = message::encrypt_pair(&mut m.sessions[0], b"thanks for the invite").unwrap();
+    match admin.recv(&e) {
+        Inbound::PairText { plaintext, .. } => {
+            assert_eq!(plaintext, b"thanks for the invite")
+        }
+        _ => panic!(),
+    }
+    // And group messaging works.
+    let ge = message::encrypt_group(&m.identity, &mut m.groups[0], b"in").unwrap();
+    match admin.recv(&ge) {
+        Inbound::GroupText { plaintext, .. } => assert_eq!(plaintext, b"in"),
+        _ => panic!(),
+    }
+}
+
+#[test]
+fn group_invite_on_used_session_still_works() {
+    // PairInit-invite must not break the established-session path:
+    // admin sends a pairwise message first (consuming the pending init),
+    // THEN invites — inner wrap is a PairMsg.
+    let mut admin = Party::new(&[52u8; 32]);
+    let mut m = Party::new(&[53u8; 32]);
+    let ca = admin.new_card();
+    let cm = m.new_card();
+    let mut s = handshake::initiate(&admin.identity, &ca, &cm).unwrap();
+    let hello = message::encrypt_pair(&mut s, b"hello first").unwrap();
+    admin.sessions.push(s);
+    match m.recv(&hello) {
+        Inbound::NewSession { session, .. } => m.sessions.push(*session),
+        _ => panic!(),
+    }
+    let (g, invite) = message::group_create(
+        &admin.identity,
+        &mut admin.sessions,
+        &[m.identity.public_id()],
+        "used",
+    )
+    .unwrap();
+    admin.groups.push(g);
+    match m.recv(&invite) {
+        Inbound::GroupJoined {
+            group,
+            inner_session,
+        } => {
+            m.groups.push(group);
+            assert!(inner_session.is_none());
+        }
+        _ => panic!("expected GroupJoined"),
+    }
+    assert_eq!(m.sessions.len(), 1);
+}
+
+#[test]
+fn group_rotate_can_add_new_member() {
+    // Rotating with a member that has no group state yet is an invite: the
+    // new member creates group state, existing members rotate.
+    let (mut admin, mut m1, _m2) = setup_group();
+    let mut m3 = Party::new(&[54u8; 32]);
+    let ca = admin.new_card();
+    let c3 = m3.new_card();
+    let mut s3 = handshake::initiate(&admin.identity, &ca, &c3).unwrap();
+    let hello = message::encrypt_pair(&mut s3, b"pair first").unwrap();
+    admin.sessions.push(s3);
+    match m3.recv(&hello) {
+        Inbound::NewSession { session, .. } => m3.sessions.push(*session),
+        _ => panic!(),
+    }
+
+    let m1_id = m1.identity.public_id();
+    let m3_id = m3.identity.public_id();
+    let rot = message::group_rotate(
+        &admin.identity,
+        &mut admin.groups[0],
+        &mut admin.sessions,
+        vec![admin.identity.public_id(), m1_id, m3_id],
+    )
+    .unwrap();
+    // m1 rotates in place
+    match m1.recv(&rot) {
+        Inbound::GroupRotated { group_index, .. } => assert_eq!(group_index, 0),
+        _ => panic!(),
+    }
+    // m3 joins from the rotate envelope (was "rotate for unknown group")
+    match m3.recv(&rot) {
+        Inbound::GroupJoined { group, .. } => m3.groups.push(group),
+        other => panic!("m3 expected GroupJoined, got {:?}", kind_name(&other)),
+    }
+    let e = message::encrypt_group(&m3.identity, &mut m3.groups[0], b"new here").unwrap();
+    match admin.recv(&e) {
+        Inbound::GroupText { plaintext, .. } => assert_eq!(plaintext, b"new here"),
+        _ => panic!(),
+    }
+}
+
+fn kind_name(i: &Inbound) -> &'static str {
+    match i {
+        Inbound::Card(_) => "Card",
+        Inbound::NewSession { .. } => "NewSession",
+        Inbound::PairText { .. } => "PairText",
+        Inbound::GroupJoined { .. } => "GroupJoined",
+        Inbound::GroupRotated { .. } => "GroupRotated",
+        Inbound::GroupText { .. } => "GroupText",
+    }
 }
 
 // helpers mirroring production framing for forgery tests

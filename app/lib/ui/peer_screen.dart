@@ -58,6 +58,11 @@ class PeerScreen extends StatelessWidget {
     final r = store.processInbound(input);
     switch (r.kind) {
       case 'card':
+        if (r.peerId == store.pubId) {
+          return const ReceivedMsg(
+              'Questo è il TUO codice di contatto — mandalo all\'amico.',
+              system: true);
+        }
         _offerAddContact(context, r.text);
         return const ReceivedMsg('Ha mandato il suo codice di contatto.',
             system: true);

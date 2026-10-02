@@ -8,7 +8,7 @@ import '../api.dart';
 import '../logo.dart';
 import '../store.dart';
 import '../main.dart' show copyToClipboard;
-import 'chat_panel.dart' show looksLikeCode;
+import 'chat_panel.dart' show looksLikeCode, decodesToEnvelope;
 import 'peer_screen.dart';
 import 'group_screen.dart';
 
@@ -105,7 +105,7 @@ class ContactsTab extends StatelessWidget {
     try {
       final clip = await Clipboard.getData(Clipboard.kTextPlain);
       final t = clip?.text?.trim() ?? '';
-      if (looksLikeCode(t)) cardCtrl.text = t;
+      if (looksLikeCode(t) || decodesToEnvelope(t)) cardCtrl.text = t;
     } catch (_) {}
     if (!context.mounted) return;
     final ok = await showDialog<bool>(
@@ -137,9 +137,13 @@ class ContactsTab extends StatelessWidget {
                 icon: const Icon(Icons.content_paste, size: 18),
                 label: const Text('Incolla dagli appunti'),
                 onPressed: () async {
-                  final d =
-                      await Clipboard.getData(Clipboard.kTextPlain);
-                  cardCtrl.text = d?.text ?? '';
+                  try {
+                    final d =
+                        await Clipboard.getData(Clipboard.kTextPlain);
+                    cardCtrl.text = d?.text ?? '';
+                  } catch (_) {
+                    // clipboard read denied (Safari): user can paste manually
+                  }
                 },
               ),
             ),
@@ -159,13 +163,25 @@ class ContactsTab extends StatelessWidget {
     try {
       // decode the pasted card through the inbound pipeline (verifies signature)
       final envB64 = AlienApi.unrender(cardCtrl.text.trim());
-      final r = AlienApi.decrypt(
-        identityB64: store.identitySeed!,
-        bundlesB64: store.bundles,
-        sessionsB64: const [],
-        groupsB64: const [],
-        envelopeB64: envB64,
-      );
+      final Map<String, dynamic> r;
+      try {
+        r = AlienApi.decrypt(
+          identityB64: store.identitySeed!,
+          bundlesB64: store.bundles,
+          sessionsB64: const [],
+          groupsB64: const [],
+          envelopeB64: envB64,
+        );
+      } catch (_) {
+        // Not a decodable standalone envelope for a fresh view (e.g. a
+        // PairMsg needing an existing session): let the full pipeline try.
+        final res = store.processInbound(cardCtrl.text.trim());
+        if (context.mounted) {
+          ScaffoldMessenger.of(context)
+              .showSnackBar(SnackBar(content: Text(res.text)));
+        }
+        return;
+      }
       if (r['kind'] != 'card') {
         // Not a card — could be a PairInit or message envelope pasted here.
         // Route it through the full inbound pipeline instead of dropping it.
@@ -173,6 +189,14 @@ class ContactsTab extends StatelessWidget {
         if (context.mounted) {
           ScaffoldMessenger.of(context)
               .showSnackBar(SnackBar(content: Text(res.text)));
+        }
+        return;
+      }
+      if (r['owner_id'] == store.pubId) {
+        if (context.mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+              content: Text(
+                  'Questo è il tuo codice — serve quello del tuo amico.')));
         }
         return;
       }
@@ -407,12 +431,13 @@ class GroupsTab extends StatelessWidget {
           .showSnackBar(SnackBar(content: Text(invite.substring(4))));
       return;
     }
-    bool copied = true;
+    var copied = true;
     try {
-      Clipboard.setData(ClipboardData(text: invite));
+      await Clipboard.setData(ClipboardData(text: invite));
     } catch (_) {
       copied = false; // Safari/web can deny clipboard: show it instead
     }
+    if (!context.mounted) return;
     await showDialog(
       context: context,
       builder: (ctx) => AlertDialog(

@@ -57,6 +57,9 @@
         }
         return k;
       })();
+      // A transient IndexedDB failure must not poison every later call:
+      // clear the cached promise so the next access retries.
+      keyPromise.catch(() => { keyPromise = null; });
     }
     return keyPromise;
   }

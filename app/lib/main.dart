@@ -89,6 +89,11 @@ class _BootState extends State<_Boot> {
         }
       } on VaultLockedException {
         // Legacy password vault: LockScreen asks for the password.
+      } catch (_) {
+        // Any other open failure (storage broken, quota, wasm backend):
+        // don't wedge on the splash forever — show the boot error.
+        if (mounted) setState(() => _bootError = true);
+        return;
       }
     }
 
@@ -165,7 +170,9 @@ class _LockScreenState extends State<LockScreen> {
     });
     try {
       await store.unlock(_pwCtrl.text);
-      // success: isLocked flips and AnimatedBuilder swaps in the real UI
+      // success: isLocked flips and AnimatedBuilder swaps in the real UI.
+      // Register the multi-tab listener the boot path skipped while locked.
+      plat.onVaultChanged(() => store.reloadFromStorage());
     } catch (_) {
       setState(() => _error = 'Password errata');
     } finally {

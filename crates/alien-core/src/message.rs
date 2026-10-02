@@ -11,6 +11,18 @@ use crate::wire::{
     MemberWrap, PairInitPayload, PairMsgPayload,
 };
 
+/// A pairwise session established while unwrapping a group invite/rotate:
+/// the admin's inner wrap was a `PairInit` because no direct message had
+/// been exchanged yet. The session is already pushed into `sessions`.
+pub struct InnerSession {
+    /// Index into `sessions` where the new session was appended.
+    pub session_index: usize,
+    /// Initiator's contact card (authenticates identity + prekeys).
+    pub peer_card: ContactCard,
+    /// Index into `bundles` of the one-time prekey bundle consumed.
+    pub bundle_index: usize,
+}
+
 /// What an inbound envelope turned out to be.
 pub enum Inbound {
     /// A bare contact card (pairing material) — show/save it.
@@ -32,9 +44,18 @@ pub enum Inbound {
         plaintext: Vec<u8>,
     },
     /// We were invited to / re-invited into a group.
-    GroupJoined(GroupState),
+    GroupJoined {
+        group: GroupState,
+        /// Set when the invite also established a pairwise session.
+        inner_session: Option<InnerSession>,
+    },
     /// Group key rotated; index into `groups` updated in place.
-    GroupRotated { group_index: usize },
+    /// (Also produced for a rotate addressed to a group we didn't have yet —
+    /// an invite by another name.)
+    GroupRotated {
+        group_index: usize,
+        inner_session: Option<InnerSession>,
+    },
     /// Group plaintext; index into `groups`.
     GroupText {
         group_index: usize,
@@ -98,8 +119,8 @@ pub fn decrypt_pair_env(session: &mut SessionState, env: &[u8]) -> Result<Vec<u8
 pub fn decrypt_any(
     me: &Identity,
     bundles: &[CardBundle],
-    sessions: &mut [SessionState],
-    groups: &mut [GroupState],
+    sessions: &mut Vec<SessionState>,
+    groups: &mut Vec<GroupState>,
     env: &[u8],
 ) -> Result<Inbound> {
     let (t, body) = wire::unframe(env)?;
@@ -191,21 +212,60 @@ pub fn decrypt_any(
                 .iter()
                 .find(|w| w.member == my)
                 .ok_or(Error::Group("not a recipient"))?;
-            // inner env is a pairwise envelope to us; find its session by
-            // peeking the session_id in the inner header. PairInit inner
-            // wraps are not supported: pair with the admin first.
+            // The inner env is a pairwise envelope addressed to us. It may be
+            // a PairMsg on an established session *or* a PairInit: the admin's
+            // first pairwise send is always a PairInit, so a group invite is
+            // a perfectly valid first message between two peers.
             let (inner_t, inner_body) = wire::unframe(&wrap.env)?;
-            if inner_t != EnvType::PairMsg {
-                return Err(Error::Group("invite needs an established pairwise session"));
-            }
-            let inner_hdr: PairMsgPayload =
-                postcard::from_bytes(inner_body).map_err(|_| Error::Serde)?;
-            let sidx = sessions
-                .iter()
-                .position(|s| s.session_id == inner_hdr.header.session_id)
-                .ok_or(Error::Ratchet("no session for invite"))?;
+            let mut inner_session: Option<InnerSession> = None;
+            let (sidx, inner_pt) = match inner_t {
+                EnvType::PairInit => {
+                    let p: PairInitPayload =
+                        postcard::from_bytes(inner_body).map_err(|_| Error::Serde)?;
+                    // Same PairInit already consumed as a direct message:
+                    // the ratchet header carries session_id, so we can route
+                    // to the existing session even if the one-time bundle was
+                    // already dropped (a verbatim replay is then rejected by
+                    // the ratchet itself).
+                    match sessions
+                        .iter()
+                        .position(|s| s.session_id == p.header.session_id)
+                    {
+                        Some(i) => (
+                            i,
+                            sessions[i].decrypt(&ad_of(inner_t), &p.header, &p.nonce, &p.ct)?,
+                        ),
+                        None => {
+                            let (mut session, bundle_index) =
+                                handshake::accept(me, bundles, &p.init)?;
+                            let pt =
+                                session.decrypt(&ad_of(inner_t), &p.header, &p.nonce, &p.ct)?;
+                            session.confirmed = true;
+                            sessions.push(session);
+                            inner_session = Some(InnerSession {
+                                session_index: sessions.len() - 1,
+                                peer_card: p.init.card,
+                                bundle_index,
+                            });
+                            (sessions.len() - 1, pt)
+                        }
+                    }
+                }
+                EnvType::PairMsg => {
+                    let inner_hdr: PairMsgPayload =
+                        postcard::from_bytes(inner_body).map_err(|_| Error::Serde)?;
+                    let i = sessions
+                        .iter()
+                        .position(|s| s.session_id == inner_hdr.header.session_id)
+                        .ok_or(Error::Ratchet("no session for invite"))?;
+                    (
+                        i,
+                        sessions[i].decrypt(&ad_of(inner_t), &inner_hdr.header, &inner_hdr.nonce, &inner_hdr.ct)?,
+                    )
+                }
+                _ => return Err(Error::Group("invite wrap is not a pairwise envelope")),
+            };
             let sender_id = sessions[sidx].peer_id;
-            let inner_pt = decrypt_pair_env(&mut sessions[sidx], &wrap.env)?;
             let inner: InviteInner = postcard::from_bytes(&inner_pt).map_err(|_| Error::Serde)?;
 
             // Authorization: the wrap must be consistent with the outer
@@ -234,11 +294,12 @@ pub fn decrypt_any(
                     inner.members,
                     &inner.name,
                 )?;
-                return Ok(Inbound::GroupRotated { group_index: gi });
+                return Ok(Inbound::GroupRotated {
+                    group_index: gi,
+                    inner_session,
+                });
             }
-            if t == EnvType::GroupRotate {
-                return Err(Error::Group("rotate for unknown group"));
-            }
+            // A rotate for an unknown group is just an invite: create state.
             let g = GroupState::from_invite(
                 inner.group_id,
                 inner.epoch,
@@ -248,7 +309,10 @@ pub fn decrypt_any(
                 &inner.name,
                 me.public_id(),
             );
-            Ok(Inbound::GroupJoined(g))
+            Ok(Inbound::GroupJoined {
+                group: g,
+                inner_session,
+            })
         }
     }
 }

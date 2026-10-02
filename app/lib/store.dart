@@ -418,15 +418,24 @@ class Store extends ChangeNotifier {
   }
 
   /// Enable/disable Windows Hello / biometrics as the unlock gate.
+  ///
+  /// Enabling Hello while the device key is PIN-wrapped restores the plain
+  /// device key (we hold it in memory — the vault is open): the two gates are
+  /// mutually exclusive, and keeping the PIN wrap while the UI says "Hello"
+  /// would still require the PIN at boot.
   Future<void> setHello(bool on) async {
     final path = _vaultPath;
     if (path == null) return;
     if (on) {
+      final pw = _devPass;
+      if (pw != null && await devkeyNeedsPin(path)) {
+        await plat.secureWrite(path, 'devkey', pw);
+      }
       await plat.secureWrite(path, 'hello', 'hello');
       lockMode = 'hello';
     } else {
       await plat.secureDelete(path, 'hello');
-      lockMode = await plat.secureRead(path, 'pin') != null ? 'pin' : null;
+      lockMode = await detectLockMode(path);
     }
     notifyListeners();
   }
@@ -535,6 +544,36 @@ class Store extends ChangeNotifier {
     }
   }
 
+  /// An invite/rotate whose inner wrap was a PairInit established a pairwise
+  /// session with the admin as a side effect. Attach it to that contact (or
+  /// create it) so direct messaging works immediately, and drop the consumed
+  /// one-time bundle.
+  void _attachInnerSession(dynamic inner) {
+    if (inner is! Map) return;
+    final consumed = inner['consumed_bundle'];
+    if (consumed is int && consumed >= 0 && consumed < bundles.length) {
+      bundles.removeAt(consumed);
+    }
+    final peerId = inner['peer_id'] as String?;
+    final sess = inner['session'] as String?;
+    if (peerId == null || sess == null) return;
+    final peerCard = inner['peer_card'] as String? ?? '';
+    final idx = contacts.indexWhere((c) => c.pubId == peerId);
+    if (idx >= 0) {
+      contacts[idx].session = sess;
+      contacts[idx].sessionId = inner['session_id'] as String?;
+      if (peerCard.isNotEmpty) contacts[idx].card = peerCard;
+    } else {
+      contacts.add(Contact(
+        name: 'Contatto ${peerId.substring(0, peerId.length < 8 ? peerId.length : 8)}',
+        pubId: peerId,
+        card: peerCard,
+        session: sess,
+        sessionId: inner['session_id'] as String?,
+      ));
+    }
+  }
+
   void _writeBackGroups(List<dynamic> blobs) {
     for (var i = 0; i < blobs.length && i < groups.length; i++) {
       groups[i].blob = blobs[i] as String;
@@ -605,6 +644,7 @@ class Store extends ChangeNotifier {
             blob: r['group'] as String,
           ));
           _writeBackSessions(r['sessions'] as List);
+          _attachInnerSession(r['inner_session']);
           _persist();
           notifyListeners();
           return InboundResult('info',
@@ -615,6 +655,7 @@ class Store extends ChangeNotifier {
         {
           _writeBackGroups(r['groups'] as List);
           _writeBackSessions(r['sessions'] as List);
+          _attachInnerSession(r['inner_session']);
           _persist();
           notifyListeners();
           return InboundResult('info', 'Chiave di gruppo ruotata');

@@ -193,6 +193,25 @@ fn sessions_json(v: &[SessionState]) -> Result<Value, String> {
     Ok(json!(arr))
 }
 
+/// Serialize info about a session created inside a group invite/rotate wrap
+/// (inner `PairInit`): the Dart side uses it to attach the session to the
+/// admin's contact (or create that contact) and drop the consumed bundle.
+fn inner_session_json(
+    s: &alien_core::message::InnerSession,
+    sessions: &[SessionState],
+) -> Result<Value, String> {
+    let sess = &sessions[s.session_index];
+    Ok(json!({
+        "session_index": s.session_index,
+        "session": b64(&sess.to_bytes().map_err(|e| e.to_string())?),
+        "session_id": hex(&sess.session_id),
+        "peer_id": hex(&sess.peer_id),
+        "peer_ed": hex(&sess.peer_ed),
+        "peer_card": b64(&s.peer_card.to_bytes().map_err(|e| e.to_string())?),
+        "consumed_bundle": s.bundle_index,
+    }))
+}
+
 fn groups_json(v: &[GroupState]) -> Result<Value, String> {
     let mut arr = Vec::with_capacity(v.len());
     for g in v {
@@ -374,19 +393,37 @@ fn run(v: &Value) -> Result<Value, String> {
                         "plaintext_b64": b64(&plaintext),
                     }))
                 }
-                Inbound::GroupJoined(g) => Ok(json!({
-                    "kind": "group_joined",
-                    "group": b64(&g.to_bytes().map_err(|e| e.to_string())?),
-                    "group_id": hex(&g.group_id),
-                    "name": g.name,
-                    "sessions": sessions_json(&sessions)?,
-                })),
-                Inbound::GroupRotated { group_index } => Ok(json!({
-                    "kind": "group_rotated",
-                    "group_index": group_index,
-                    "groups": groups_json(&groups)?,
-                    "sessions": sessions_json(&sessions)?,
-                })),
+                Inbound::GroupJoined {
+                    group,
+                    inner_session,
+                } => {
+                    let mut o = json!({
+                        "kind": "group_joined",
+                        "group": b64(&group.to_bytes().map_err(|e| e.to_string())?),
+                        "group_id": hex(&group.group_id),
+                        "name": group.name,
+                        "sessions": sessions_json(&sessions)?,
+                    });
+                    if let Some(s) = inner_session {
+                        o["inner_session"] = inner_session_json(&s, &sessions)?;
+                    }
+                    Ok(o)
+                }
+                Inbound::GroupRotated {
+                    group_index,
+                    inner_session,
+                } => {
+                    let mut o = json!({
+                        "kind": "group_rotated",
+                        "group_index": group_index,
+                        "groups": groups_json(&groups)?,
+                        "sessions": sessions_json(&sessions)?,
+                    });
+                    if let Some(s) = inner_session {
+                        o["inner_session"] = inner_session_json(&s, &sessions)?;
+                    }
+                    Ok(o)
+                }
                 Inbound::GroupText {
                     group_index,
                     sender,
@@ -465,6 +502,11 @@ fn run(v: &Value) -> Result<Value, String> {
         "unrender" => {
             let text = get_str(v, "text")?;
             let raw = alien_codec::decode(text).map_err(|e| e.to_string())?;
+            // Everything we render is a framed wire envelope: reject anything
+            // else up front so callers get "not an AlienMsg code" instead of
+            // an opaque deserialize/decrypt error on prose that happened to
+            // decode (every-Italian-word text is legal `frasi` input).
+            alien_core::wire::unframe(&raw).map_err(|_| "not an AlienMsg code")?;
             Ok(json!({"bytes": b64(&raw)}))
         }
         "vault_open" => {

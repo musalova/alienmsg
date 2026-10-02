@@ -167,3 +167,58 @@ fn ffi_full_flow() {
     assert_eq!(dg["kind"], "group_text");
     assert_eq!(dg["plaintext"], "segreto di gruppo");
 }
+
+#[test]
+fn ffi_group_invite_on_fresh_session() {
+    // Regression: admin pairs with a member but never sends a pairwise
+    // message — the invite's inner wrap is then a PairInit. The member must
+    // both accept the handshake AND join the group in one decrypt call.
+    let m1 = ok(json!({"op":"mnemonic_generate"}))["mnemonic"].as_str().unwrap().to_string();
+    let m2 = ok(json!({"op":"mnemonic_generate"}))["mnemonic"].as_str().unwrap().to_string();
+    let mut alice = Device::new(&m1);
+    let mut bob = Device::new(&m2);
+
+    let (_ca_env, card_a) = alice.make_card();
+    let (_cb_env, card_b) = bob.make_card();
+
+    let s = ok(json!({
+        "op":"session_start","identity":alice.identity,
+        "my_card":card_a,"peer_card":card_b}));
+    alice.sessions.push(s["session"].as_str().unwrap().to_string());
+    let bob_id = s["peer_id"].as_str().unwrap().to_string();
+
+    // No pairwise message — straight to group creation.
+    let gc = ok(json!({
+        "op":"group_create","identity":alice.identity,
+        "sessions":alice.sessions,"member_ids":[bob_id],"name":"subito"}));
+    alice.sessions = gc["sessions"].as_array().unwrap().iter()
+        .map(|v| v.as_str().unwrap().to_string()).collect();
+    alice.groups.push(gc["group"].as_str().unwrap().to_string());
+
+    let dj = bob.recv(gc["envelope"].as_str().unwrap());
+    assert_eq!(dj["kind"], "group_joined");
+    bob.groups.push(dj["group"].as_str().unwrap().to_string());
+    // The invite also delivered a pairwise session with the admin.
+    let inner = dj["inner_session"].as_object().expect("missing inner_session");
+    assert!(inner["session"].as_str().is_some());
+    assert!(inner["peer_card"].as_str().is_some());
+    // Bob's session list from the response already contains it.
+    assert_eq!(bob.sessions.len(), 1);
+
+    // Pairwise messaging works on that invite-created session.
+    let e = ok(json!({
+        "op":"encrypt","session":bob.sessions[0],"plaintext":"grazie"}));
+    bob.sessions[0] = e["session"].as_str().unwrap().to_string();
+    let d = alice.recv(e["envelope"].as_str().unwrap());
+    assert_eq!(d["kind"], "pair");
+    assert_eq!(d["plaintext"], "grazie");
+
+    // Group messaging works too.
+    let ge = ok(json!({
+        "op":"group_encrypt","identity":bob.identity,
+        "group":bob.groups[0],"plaintext":"dentro"}));
+    bob.groups[0] = ge["group"].as_str().unwrap().to_string();
+    let dg = alice.recv(ge["envelope"].as_str().unwrap());
+    assert_eq!(dg["kind"], "group_text");
+    assert_eq!(dg["plaintext"], "dentro");
+}

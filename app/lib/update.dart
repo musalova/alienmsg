@@ -87,11 +87,13 @@ class UpdateChecker {
                 onPressed: () => Navigator.pop(ctx),
                 child: const Text('Dopo')),
           FilledButton.icon(
-            onPressed: () {
-              launchUrl(Uri.parse(info.url),
-                  mode: LaunchMode.externalApplication);
-              if (!info.mandatory) Navigator.pop(ctx);
-            },
+            onPressed: info.url.isEmpty
+                ? null
+                : () {
+                    launchUrl(Uri.parse(info.url),
+                        mode: LaunchMode.externalApplication);
+                    if (!info.mandatory) Navigator.pop(ctx);
+                  },
             icon: const Icon(Icons.download),
             label: const Text('Aggiorna'),
           ),

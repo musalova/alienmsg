@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../api.dart';
 import '../store.dart';
 
 /// A received item decoded from the transport pipeline.
@@ -26,6 +27,20 @@ bool looksLikeCode(String t) {
   return s.startsWith('AYA1:') ||
       s.contains('👽') ||
       (s.length > 100 && _wordsRe.hasMatch(s));
+}
+
+/// Definitive check: decodes [t] and validates the wire frame. Catches the
+/// `frasi` format, which is indistinguishable from ordinary prose by regex.
+/// Cheap and synchronous on both transports.
+bool decodesToEnvelope(String t) {
+  final s = t.trim();
+  if (s.isEmpty || s.length > 512 * 1024) return false;
+  try {
+    AlienApi.unrender(s);
+    return true;
+  } catch (_) {
+    return false;
+  }
 }
 
 /// Chat-style panel for non-technical users: one field to write, one button
@@ -84,7 +99,9 @@ class _ChatPanelState extends State<ChatPanel> {
     try {
       final d = await Clipboard.getData(Clipboard.kTextPlain);
       final t = d?.text ?? '';
-      if (mounted && looksLikeCode(t) && t.trim() != _lastCopied) {
+      if (mounted &&
+          t.trim() != _lastCopied &&
+          (looksLikeCode(t) || decodesToEnvelope(t))) {
         setState(() => _codeInClipboard = true);
       }
     } catch (_) {}
@@ -107,7 +124,7 @@ class _ChatPanelState extends State<ChatPanel> {
   void _snack(String text) => ScaffoldMessenger.of(context)
       .showSnackBar(SnackBar(content: Text(text)));
 
-  void _send() {
+  Future<void> _send() async {
     final pt = _ctrl.text.trim();
     if (pt.isEmpty) return;
     final String code;
@@ -117,9 +134,11 @@ class _ChatPanelState extends State<ChatPanel> {
       _snack('Errore: $e');
       return;
     }
-    bool copied = true;
+    // Clipboard.setData is async — without await, a Safari/web permission
+    // rejection escapes this try/catch and the code would be lost silently.
+    var copied = true;
     try {
-      Clipboard.setData(ClipboardData(text: code));
+      await Clipboard.setData(ClipboardData(text: code));
     } catch (_) {
       copied = false; // web clipboard can be denied: never lose the code
     }
@@ -174,8 +193,25 @@ class _ChatPanelState extends State<ChatPanel> {
       return 'Già letto — questo codice era già stato usato.';
     }
     if (s.contains('unknown') || s.contains('unsupported') ||
-        s.contains('Malformed') || s.contains('Unknown')) {
+        s.contains('Malformed') || s.contains('Unknown') ||
+        s.contains('unrecognized') || s.contains('not an AlienMsg code') ||
+        s.contains('bad envelope')) {
       return 'Questo non sembra un codice AlienMsg.';
+    }
+    if (s.contains('not a recipient')) {
+      return 'Questo codice non è per te — chiedi di rifare l\'invito.';
+    }
+    if (s.contains('no session') || s.contains('unknown group')) {
+      return 'Manca il collegamento: scambiate prima i codici di contatto.';
+    }
+    if (s.contains('stale rotation') || s.contains('already processed')) {
+      return 'Codice già applicato — niente da fare.';
+    }
+    if (s.contains('signature') || s.contains('Signature')) {
+      return 'Firma non valida — il codice potrebbe essere stato alterato.';
+    }
+    if (s.contains('Decrypt') || s.contains('decryption')) {
+      return 'Codice corrotto o non indirizzato a te.';
     }
     return 'Non riesco a leggerlo: $s';
   }

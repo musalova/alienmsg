@@ -85,6 +85,7 @@ class GroupScreen extends StatelessWidget {
                           tooltip: 'Rimuovi dal gruppo',
                           icon: const Icon(Icons.remove_circle_outline),
                           onPressed: () => _removeMember(
+                              context,
                               ctx,
                               m['id'] as String,
                               members
@@ -97,8 +98,145 @@ class GroupScreen extends StatelessWidget {
           ),
         ),
         actions: [
+          if (isAdmin)
+            TextButton.icon(
+              icon: const Icon(Icons.person_add_alt_1, size: 18),
+              label: const Text('Aggiungi membro'),
+              onPressed: () => _addMember(
+                  context,
+                  ctx,
+                  members.map((x) => x['id'] as String).toList()),
+            ),
           TextButton(
               onPressed: () => Navigator.pop(ctx), child: const Text('Chiudi')),
+        ],
+      ),
+    );
+  }
+
+  /// Rotate the group key with [newMemberIds] added — under the hood the
+  /// rotate envelope doubles as an invite for members with no group state.
+  Future<void> _addMember(BuildContext screenCtx, BuildContext dialogCtx,
+      List<String> memberIds) async {
+    final candidates = store.contacts
+        .where((c) => c.session != null && !memberIds.contains(c.pubId))
+        .toList();
+    if (candidates.isEmpty) {
+      Navigator.pop(dialogCtx);
+      ScaffoldMessenger.of(screenCtx).showSnackBar(const SnackBar(
+          content: Text(
+              'Nessun amico da aggiungere — collega prima un nuovo contatto.')));
+      return;
+    }
+    final selected = <String>{};
+    final ok = await showDialog<bool>(
+      context: screenCtx,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setD) => AlertDialog(
+          title: const Text('Aggiungi al gruppo'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              for (final c in candidates)
+                CheckboxListTile(
+                  dense: true,
+                  title: Text(c.name),
+                  value: selected.contains(c.pubId),
+                  onChanged: (v) => setD(() => v == true
+                      ? selected.add(c.pubId)
+                      : selected.remove(c.pubId)),
+                ),
+            ],
+          ),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(ctx, false),
+                child: const Text('Annulla')),
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Aggiungi'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (ok != true || selected.isEmpty || !screenCtx.mounted) return;
+    try {
+      final blob =
+          store.rotateGroup(group, [...memberIds, ...selected]);
+      Navigator.pop(dialogCtx); // close the members list
+      await _shareRotate(screenCtx, blob,
+          'Invito inviato: incolla il codice nella chat. I nuovi amici entrano '
+          'automaticamente e tutti passano alle nuove chiavi.');
+    } catch (e) {
+      if (screenCtx.mounted) {
+        ScaffoldMessenger.of(screenCtx)
+            .showSnackBar(SnackBar(content: Text('Errore: $e')));
+      }
+    }
+  }
+
+  Future<void> _removeMember(BuildContext screenCtx, BuildContext dialogCtx,
+      String removeId, List<String> all) async {
+    try {
+      final keep = all.where((id) => id != removeId).toList();
+      final blob = store.rotateGroup(group, keep);
+      Navigator.pop(dialogCtx);
+      await _shareRotate(screenCtx, blob,
+          'Gli altri membri passeranno alle nuove chiavi e chi è uscito non '
+          'potrà più leggere.');
+    } catch (e) {
+      if (screenCtx.mounted) {
+        ScaffoldMessenger.of(screenCtx)
+            .showSnackBar(SnackBar(content: Text('Errore: $e')));
+      }
+    }
+  }
+
+  /// Copy the rotate/invite blob to the clipboard (with a visible fallback)
+  /// and explain what to do with it.
+  Future<void> _shareRotate(
+      BuildContext ctx, String blob, String explanation) async {
+    var copied = true;
+    try {
+      await Clipboard.setData(ClipboardData(text: blob));
+    } catch (_) {
+      copied = false; // web clipboard can be denied: show the code instead
+    }
+    if (!ctx.mounted) return;
+    await showDialog(
+      context: ctx,
+      builder: (ctx2) => AlertDialog(
+        title: const Text('Gruppo aggiornato'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(copied
+                ? 'Ho copiato un codice di aggiornamento: incollalo nella '
+                    'chat con i membri. $explanation'
+                : 'Incolla questo codice di aggiornamento nella chat con i '
+                    'membri. $explanation'),
+            const SizedBox(height: 12),
+            Container(
+              constraints: const BoxConstraints(maxHeight: 120),
+              child: SingleChildScrollView(
+                child: SelectableText(blob,
+                    style: const TextStyle(
+                        fontFamily: 'monospace', fontSize: 10)),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton.icon(
+            onPressed: () => copyToClipboard(ctx2, blob, 'Codice copiato'),
+            icon: const Icon(Icons.copy, size: 18),
+            label: const Text('Copia'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx2),
+            child: const Text('Fatto'),
+          ),
         ],
       ),
     );
@@ -113,64 +251,4 @@ class GroupScreen extends StatelessWidget {
     return 'Membro ${pubId.substring(0, 8)}';
   }
 
-  Future<void> _removeMember(
-      BuildContext dialogCtx, String removeId, List<String> all) async {
-    try {
-      final keep = all.where((id) => id != removeId).toList();
-      final blob = store.rotateGroup(group, keep);
-      bool copied = true;
-      try {
-        Clipboard.setData(ClipboardData(text: blob));
-      } catch (_) {
-        copied = false; // web clipboard can be denied: show the code instead
-      }
-      if (dialogCtx.mounted) {
-        Navigator.pop(dialogCtx);
-        await showDialog(
-          context: dialogCtx,
-          builder: (ctx2) => AlertDialog(
-            title: const Text('Membro rimosso'),
-            content: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(copied
-                    ? 'Ho copiato un codice di aggiornamento: incollalo nel '
-                        'gruppo. Gli altri membri passeranno alle nuove '
-                        'chiavi e chi è uscito non potrà più leggere.'
-                    : 'Incolla questo codice di aggiornamento nel gruppo: '
-                        'gli altri membri passeranno alle nuove chiavi e chi '
-                        'è uscito non potrà più leggere.'),
-                const SizedBox(height: 12),
-                Container(
-                  constraints: const BoxConstraints(maxHeight: 120),
-                  child: SingleChildScrollView(
-                    child: SelectableText(blob,
-                        style: const TextStyle(
-                            fontFamily: 'monospace', fontSize: 10)),
-                  ),
-                ),
-              ],
-            ),
-            actions: [
-              TextButton.icon(
-                onPressed: () =>
-                    copyToClipboard(ctx2, blob, 'Codice copiato'),
-                icon: const Icon(Icons.copy, size: 18),
-                label: const Text('Copia'),
-              ),
-              FilledButton(
-                onPressed: () => Navigator.pop(ctx2),
-                child: const Text('Fatto'),
-              ),
-            ],
-          ),
-        );
-      }
-    } catch (e) {
-      if (dialogCtx.mounted) {
-        ScaffoldMessenger.of(dialogCtx)
-            .showSnackBar(SnackBar(content: Text('Errore: $e')));
-      }
-    }
-  }
 }
