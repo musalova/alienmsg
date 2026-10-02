@@ -81,8 +81,10 @@ più recente al reload.
 2. **Pairing**: ogni peer genera una *carta contatto* fresca e la invia
    (incolla/QR). Incolla la carta del peer → "Abbina". Verifica il codice di
    sicurezza (SAS) di persona per escludere MITM.
-3. **Messaggi**: scrivi → scegli formato (Blob `AYA1:…`, Emoji `👽…`, Parole)
-   → copia e incolla dove vuoi. Per leggere: incolla e "Decifra".
+3. **Messaggi**: scrivi → scegli formato (Frasi italiane — predefinito,
+   Blob `AYA1:…`, Emoji `👽…`, Parole inventate) → copia e incolla dove
+   vuoi. Per leggere: incolla e "Decifra" — il formato è riconosciuto
+   automaticamente.
 4. **Gruppi**: crea → incolla il blob di invito nel canale. Rimozione membro →
    blob di rotazione: chi esce non legge più i messaggi futuri.
 
